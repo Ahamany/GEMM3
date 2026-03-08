@@ -1,0 +1,6 @@
+/api_mumax/
+/dataset/
+*.out/
+
+*.mx3
+geometry_info.json
