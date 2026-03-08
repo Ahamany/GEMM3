@@ -84,7 +84,7 @@ def compute_grid(bbox_x: float, bbox_y: float, bbox_z: float):
 
 def generate_nanotube(rng: random.Random):
     """Полый цилиндр (нанотрубка) вдоль оси z."""
-    R_outer_nm = rng.uniform(20, 60)           # нм
+    R_outer_nm = rng.uniform(20, 60)
     wall_nm    = rng.uniform(4, min(15, R_outer_nm - 4))
     length_nm  = rng.uniform(60, 200)
 
