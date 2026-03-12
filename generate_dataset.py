@@ -1,52 +1,31 @@
 #!/usr/bin/env python3
-"""
-generate_dataset.py
-===================
-Генерирует тренировочный датасет папок с симуляциями MuMax3 для
-обучения E(3)-эквивариантных GNN. Каждая папка содержит:
-  - sim.mx3   : валидный входной скрипт MuMax3
-  - geometry_info.json : параметры + аналитическое уравнение поверхности
+"""Generate training dataset of magnetic nanostructure configurations for EGNN.
 
-После создания всех папок в корневой директории записывается единый
-файл ``tasks.txt`` (один путь к директории на строку) для запуска
-через SLURM Job Array.
+Creates sim_XXXX folders, each containing:
+  - sim.mx3       : Mumax3 simulation script
+  - geometry_info.json : shape parameters + analytical surface equations
 
-Использование
--------------
-    python3 generate_dataset.py                        # 100 образцов → ./dataset
-    python3 generate_dataset.py --num_samples 5 \\
-                                --output_dir test_dataset
+Also writes tasks.txt for SLURM Job Array integration.
 """
 
-from __future__ import annotations
-
-import argparse
+import os
 import json
 import math
-import os
 import random
-import textwrap
-from pathlib import Path
-from typing import Any
+import argparse
+
+# ---------------------------------------------------------------------------
+# Physical constants (fixed for all simulations)
+# ---------------------------------------------------------------------------
+CELL = 2e-9    # cell size  [m]
+PAD = 16e-9    # padding    [m] (8 cells per side)
 
 
 # ---------------------------------------------------------------------------
-# Физические константы, используемые в каждой симуляции
+# Helpers
 # ---------------------------------------------------------------------------
-CELL_SIZE_M = 2e-9          # размер ячейки нм
-PADDING_M   = 16e-9         # отступ нм с каждой стороны
-PADDING_CELLS = int(PADDING_M / CELL_SIZE_M)  # количество ячеек с каждй стороны
-
-AEX   = 1.3e-11   # Дж/м  – константа обменного взаимодействия
-MSAT  = 8e5        # А/м   – намагниченность насыщения
-ALPHA = 0.5        # –     – затухание Гильберта
-
-
-# ---------------------------------------------------------------------------
-# Вспомогательные функции для вычисления сетки, удобной для БПФ (FFT)
-# ---------------------------------------------------------------------------
-def _is_fft_friendly(n: int) -> bool:
-    """Возвращает True, если *n* имеет только малые простые множители (2, 3, 5, 7)."""
+def is_fft_friendly(n):
+    """True if n factors entirely into primes 2, 3, 5, 7."""
     if n <= 0:
         return False
     for p in (2, 3, 5, 7):
@@ -55,423 +34,342 @@ def _is_fft_friendly(n: int) -> bool:
     return n == 1
 
 
-def round_to_fft_friendly(n: int) -> int:
-    """Округляет *n* **вверх** до ближайшего целого числа, удобного для БПФ (≥ n)."""
-    candidate = n
-    while not _is_fft_friendly(candidate):
-        candidate += 1
-    return candidate
+def next_fft_friendly(n):
+    """Smallest integer >= n whose prime factors are only 2, 3, 5, 7."""
+    n = max(1, int(math.ceil(n)))
+    while not is_fft_friendly(n):
+        n += 1
+    return n
 
 
-def compute_grid(bbox_x: float, bbox_y: float, bbox_z: float):
-    """
-    Принимая размеры ограничивающего параллелепипеда объекта (в метрах),
-    возвращает (Nx, Ny, Nz) после добавления отступа *PADDING_M* с каждой
-    стороны и округления до значений, удобных для БПФ.
-    """
-    sizes = []
-    for dim in (bbox_x, bbox_y, bbox_z):
-        total = dim + 2 * PADDING_M
-        n_cells = max(1, math.ceil(total / CELL_SIZE_M))
-        sizes.append(round_to_fft_friendly(n_cells))
-    return tuple(sizes)
+def grid_dims(obj_x, obj_y, obj_z):
+    """FFT-friendly grid dimensions (cells) for object bbox + padding."""
+    nx = next_fft_friendly(math.ceil((obj_x + 2 * PAD) / CELL))
+    ny = next_fft_friendly(math.ceil((obj_y + 2 * PAD) / CELL))
+    nz = next_fft_friendly(math.ceil((obj_z + 2 * PAD) / CELL))
+    return nx, ny, nz
 
 
-# ===================================================================
-# Генераторы геометрии
-# Каждый возвращает (mx3_shape_expr, params_dict, surface_equation_str)
-# ===================================================================
+def fv(v):
+    """Format a float for insertion into an .mx3 script."""
+    return f"{v:.10g}"
 
-def generate_nanotube(rng: random.Random):
-    """Полый цилиндр (нанотрубка) вдоль оси z."""
-    R_outer_nm = rng.uniform(20, 60)
-    wall_nm    = rng.uniform(4, min(15, R_outer_nm - 4))
-    length_nm  = rng.uniform(60, 200)
 
-    R_outer = R_outer_nm * 1e-9
-    R_inner = (R_outer_nm - wall_nm) * 1e-9
-    L       = length_nm * 1e-9
+# ---------------------------------------------------------------------------
+# mx3 assembly
+# ---------------------------------------------------------------------------
+def build_mx3(nx, ny, nz, geom_lines, seed):
+    """Return complete .mx3 script as a string."""
+    L = []
+    L.append(f"SetGridSize({nx}, {ny}, {nz})")
+    L.append(f"SetCellSize({fv(CELL)}, {fv(CELL)}, {fv(CELL)})")
+    L.append("")
+    L.append("// Geometry")
+    L.extend(geom_lines)
+    L.append("EdgeSmooth = 8")
+    L.append("SetGeom(geo)")
+    L.append("")
+    L.append("// Material parameters")
+    L.append("Msat  = 8e5")
+    L.append("Aex   = 1.3e-11")
+    L.append("alpha = 0.5")
+    L.append("")
+    L.append("// Random initial magnetization")
+    L.append(f"m = RandomMagSeed({seed})")
+    L.append("")
+    L.append("OutputFormat = OVF2_BINARY")
+    L.append("")
+    L.append("// Energy minimisation")
+    L.append("Relax()")
+    L.append("")
+    L.append("// Save relaxed state")
+    L.append("Save(m)")
+    return "\n".join(L) + "\n"
 
-    # MuMax3: Cylinder(diameter, height)
-    outer_diam = f"{2*R_outer:.6e}"
-    inner_diam = f"{2*R_inner:.6e}"
-    height     = f"{L:.6e}"
 
-    shape_expr = (
-        f"Cylinder({outer_diam}, {height})"
-        f".Sub(Cylinder({inner_diam}, {height}))"
+# ---------------------------------------------------------------------------
+# Shape generators
+# ---------------------------------------------------------------------------
+# Each returns (geom_lines, params_dict, analytical_surface_dict, bbox_tuple)
+
+
+def gen_nanotube(rng):
+    R_out = rng.uniform(15e-9, 40e-9)
+    wall = rng.uniform(6e-9, min(20e-9, R_out - 4e-9))
+    R_in = R_out - wall
+    length = rng.uniform(40e-9, 120e-9)
+
+    geom = [
+        f"geo := Cylinder({fv(2*R_out)}, {fv(length)})"
+        f".Sub(Cylinder({fv(2*R_in)}, {fv(length)}))",
+    ]
+
+    params = dict(
+        shape_type="nanotube",
+        R_outer_m=R_out,
+        R_inner_m=R_in,
+        length_m=length,
+        wall_thickness_m=wall,
     )
 
-    params = {
-        "R_outer_m": R_outer,
-        "R_inner_m": R_inner,
-        "wall_thickness_m": wall_nm * 1e-9,
-        "length_m": L,
-    }
-
-    equation = (
-        f"Outer surface: x² + y² = ({R_outer:.6e})², "
-        f"-{L/2:.6e} ≤ z ≤ {L/2:.6e}; "
-        f"Inner surface: x² + y² = ({R_inner:.6e})², "
-        f"-{L/2:.6e} ≤ z ≤ {L/2:.6e}"
+    surface = dict(
+        implicit_body="R_inner^2 <= x^2 + y^2 <= R_outer^2  AND  |z| <= L/2",
+        surfaces=[
+            dict(name="outer_cylinder", type="cylinder",
+                 equation="x^2 + y^2 - R_outer^2 = 0",
+                 axis="z", R=R_out,
+                 z_range=[-length / 2, length / 2]),
+            dict(name="inner_cylinder", type="cylinder",
+                 equation="x^2 + y^2 - R_inner^2 = 0",
+                 axis="z", R=R_in,
+                 z_range=[-length / 2, length / 2]),
+            dict(name="top_cap", type="annular_disk",
+                 equation="z - L/2 = 0",
+                 z=length / 2, R_inner=R_in, R_outer=R_out),
+            dict(name="bottom_cap", type="annular_disk",
+                 equation="z + L/2 = 0",
+                 z=-length / 2, R_inner=R_in, R_outer=R_out),
+        ],
     )
 
-    bbox = (2 * R_outer, 2 * R_outer, L)
-    return shape_expr, params, equation, bbox, "nanotube"
+    bbox = (2 * R_out, 2 * R_out, length)
+    return geom, params, surface, bbox
 
 
-def generate_torus(rng: random.Random):
-    """
-    Тор с большим радиусом R и малым радиусом r.
+def gen_torus(rng):
+    R = rng.uniform(20e-9, 50e-9)
+    r = rng.uniform(8e-9, min(20e-9, R - 4e-9))
 
-    Используется метод **Z-нарезки**, который точно ложится на конечно-разностную сетку:
-    тор нарезается на горизонтальные слои толщиной = cell_size.
-    На каждом уровне z неявное уравнение тора
+    N = max(36, int(math.ceil(2 * math.pi * R / r)))
+    d = 2 * r
 
-        (sqrt(x² + y²) - R)² + z² = r²
+    lines = []
+    for i in range(N):
+        a = i * 2 * math.pi / N
+        x = R * math.cos(a)
+        y = R * math.sin(a)
+        sphere = f"Ellipsoid({fv(d)}, {fv(d)}, {fv(d)}).Transl({fv(x)}, {fv(y)}, 0)"
+        if i == 0:
+            lines.append(f"geo := {sphere}")
+        else:
+            lines.append(f"geo = geo.Add({sphere})")
 
-    решается аналитически для получения кольцевого сечения:
+    params = dict(
+        shape_type="torus",
+        R_major_m=R,
+        r_minor_m=r,
+        N_csg_spheres=N,
+    )
 
-        R_out(z) = R + sqrt(r² - z²)
-        R_in(z)  = R - sqrt(r² - z²)
-
-    Каждый слой становится  Cylinder(2·R_out, dz).Sub(Cylinder(2·R_in, dz)),
-    сдвинутым на нужную позицию z
-    """
-    R_major_nm = rng.uniform(30, 80)
-    r_minor_nm = rng.uniform(8, min(25, R_major_nm - 5))
-
-    R  = R_major_nm * 1e-9          # большой радиус (м)
-    r  = r_minor_nm * 1e-9          # малый радиус (м)
-    dz = CELL_SIZE_M                # толщина среза = размер ячейки
-
-    # Количество слоев z, охватывающих тор на интервале [-r, +r]
-    n_slices = math.ceil(2 * r / dz)
-
-    slices: list[str] = []
-    for i in range(n_slices):
-        z_lo     = -r + i * dz
-        z_hi     = z_lo + dz
-        z_center = 0.5 * (z_lo + z_hi)
-
-        # Создаем срез только если его центр находится внутри тора
-        if abs(z_center) >= r:
-            continue
-
-        # Аналитические радиусы кольца из уравнения тора
-        delta = math.sqrt(r**2 - z_center**2)
-        R_out = R + delta           # внешний радиус кольца на высоте z
-        R_in  = R - delta           # внутренний радиус кольца на высоте z
-
-        outer_d = f"{2 * R_out:.6e}"
-        inner_d = f"{2 * R_in:.6e}"
-        h       = f"{dz:.6e}"
-        z_pos   = f"{z_center:.6e}"
-
-        s = (
-            f"Cylinder({outer_d}, {h})"
-            f".Sub(Cylinder({inner_d}, {h}))"
-            f".Transl(0, 0, {z_pos})"
-        )
-        slices.append(s)
-
-    # Соединяем все z-срезы с помощью .Add()
-    shape_expr = slices[0]
-    for s in slices[1:]:
-        shape_expr = f"{shape_expr}.Add({s})"
-
-    params = {
-        "R_major_m": R,
-        "r_minor_m": r,
-        "z_slices": len(slices),
-        "slice_thickness_m": dz,
-    }
-
-    equation = (
-        f"(sqrt(x² + y²) - {R:.6e})² + z² = ({r:.6e})²"
+    surface = dict(
+        implicit_body="(sqrt(x^2 + y^2) - R_major)^2 + z^2 <= r_minor^2",
+        surfaces=[
+            dict(
+                name="torus_surface", type="torus",
+                equation="(sqrt(x^2 + y^2) - R_major)^2 + z^2 - r_minor^2 = 0",
+                R_major=R, r_minor=r,
+                parametric=dict(
+                    x="(R_major + r_minor*cos(v))*cos(u)",
+                    y="(R_major + r_minor*cos(v))*sin(u)",
+                    z="r_minor*sin(v)",
+                    u_range=[0, "2*pi"], v_range=[0, "2*pi"],
+                ),
+            ),
+        ],
     )
 
     bbox = (2 * (R + r), 2 * (R + r), 2 * r)
-    return shape_expr, params, equation, bbox, "torus"
+    return lines, params, surface, bbox
 
 
-def generate_hollow_sphere(rng: random.Random):
-    """Полая сфера, построенная через вычитание эллипсоидов"""
-    R_outer_nm = rng.uniform(20, 60)
-    wall_nm    = rng.uniform(4, min(15, R_outer_nm - 4))
+def gen_hollow_sphere(rng):
+    R_out = rng.uniform(20e-9, 50e-9)
+    wall = rng.uniform(6e-9, min(25e-9, R_out - 4e-9))
+    R_in = R_out - wall
 
-    R_outer = R_outer_nm * 1e-9
-    R_inner = (R_outer_nm - wall_nm) * 1e-9
+    d_out, d_in = 2 * R_out, 2 * R_in
+    geom = [
+        f"geo := Ellipsoid({fv(d_out)}, {fv(d_out)}, {fv(d_out)})"
+        f".Sub(Ellipsoid({fv(d_in)}, {fv(d_in)}, {fv(d_in)}))",
+    ]
 
-    outer_diam = f"{2*R_outer:.6e}"
-    inner_diam = f"{2*R_inner:.6e}"
-
-    shape_expr = (
-        f"Ellipsoid({outer_diam}, {outer_diam}, {outer_diam})"
-        f".Sub(Ellipsoid({inner_diam}, {inner_diam}, {inner_diam}))"
+    params = dict(
+        shape_type="hollow_sphere",
+        R_outer_m=R_out,
+        R_inner_m=R_in,
+        wall_thickness_m=wall,
     )
 
-    params = {
-        "R_outer_m": R_outer,
-        "R_inner_m": R_inner,
-        "wall_thickness_m": wall_nm * 1e-9,
-    }
-
-    equation = (
-        f"Outer surface: x² + y² + z² = ({R_outer:.6e})²; "
-        f"Inner surface: x² + y² + z² = ({R_inner:.6e})²"
-    )
-
-    bbox = (2 * R_outer, 2 * R_outer, 2 * R_outer)
-    return shape_expr, params, equation, bbox, "hollow_sphere"
-
-
-def generate_chiral_twisted_wire(rng: random.Random):
-    """
-    Прямая сплошная закрученная нанонить (Chiral Twisted Wire).
-    Генерируется прямой стержень с эллиптическим сечением, которое плавно закручивается вдоль оси Z.
-    """
-    # ── Случайная генерация параметров ──────────────────────────────
-    D_major_nm = rng.uniform(40.0, 80.0)      # большой диаметр эллипса [нм]
-    D_minor_nm = rng.uniform(15.0, 30.0)      # малый диаметр эллипса [нм]
-    length_nm  = rng.uniform(100.0, 300.0)    # длина стержня [нм]
-    
-    n_turns    = rng.uniform(1.0, 4.0)        # количество полных оборотов сечения
-    chirality  = rng.choice([-1, 1])          # хиральность: правое (+1) или левое (-1) закручивание
-    
-    # ── Перевод в СИ (метры) ───────────────────────────────────────
-    D_major = D_major_nm * 1e-9
-    D_minor = D_minor_nm * 1e-9
-    L       = length_nm * 1e-9
-    
-    # ── Дискретизация по оси Z ─────────────────────────────────────
-    # Шаг нарезки равен размеру ячейки симуляции
-    dz = CELL_SIZE_M
-    n_slices = max(2, math.ceil(L / dz))
-    dz = L / n_slices  # точный равномерный шаг
-    
-    slices: list[str] = []
-    
-    scale_y = D_minor / D_major
-    d_str = f"{D_major:.6e}"
-    dz_str = f"{dz:.6e}"
-    
-    for i in range(n_slices):
-        # Центр текущего слоя по Z
-        z_center = -L / 2.0 + i * dz + dz / 2.0
-        
-        # Угол поворота сечения на данной высоте (от 0 до 2*pi*n_turns)
-        theta = chirality * (2.0 * math.pi * n_turns) * (z_center + L / 2.0) / L
-        
-        # Строим слой: Цилиндр -> сплющиваем в эллипс -> поворачиваем -> сдвигаем по Z
-        slice_expr = (
-            f"Cylinder({d_str}, {dz_str})"
-            f".Scale(1.0, {scale_y:.6e}, 1.0)"
-            f".RotZ({theta:.6e})"
-            f".Transl(0, 0, {z_center:.6e})"
+    def _sphere_surf(name, R_val):
+        return dict(
+            name=name, type="sphere",
+            equation=f"x^2 + y^2 + z^2 - R^2 = 0",
+            R=R_val,
+            parametric=dict(
+                x="R*sin(theta)*cos(phi)",
+                y="R*sin(theta)*sin(phi)",
+                z="R*cos(theta)",
+                theta_range=[0, "pi"], phi_range=[0, "2*pi"],
+            ),
         )
-        slices.append(slice_expr)
-        
-    # ── Сборка сбалансированного бинарного CSG-дерева ──────────────
-    def build_csg_tree(nodes: list[str]) -> str:
-        if not nodes:
-            return ""
-        if len(nodes) == 1:
-            return nodes[0]
-        mid = len(nodes) // 2
-        left = build_csg_tree(nodes[:mid])
-        right = build_csg_tree(nodes[mid:])
-        return f"({left}).Add({right})"
-        
-    shape_expr = build_csg_tree(slices)
-    
-    # ── Словарь параметров ────────────────────────────────────────
-    params = {
-        "D_major_m": D_major,
-        "D_minor_m": D_minor,
-        "length_m": L,
-        "n_turns": n_turns,
-        "chirality": chirality,
-        "z_slices": n_slices,
-        "slice_thickness_m": dz
-    }
-    
-    # ── Аналитическое уравнение поверхности ────────────────────────
-    chi_sym = "+1" if chirality == 1 else "-1"
-    equation = (
-        f"Twisted solid wire along Z: cross-section is an ellipse with axes "
-        f"a={D_major/2:.6e}, b={D_minor/2:.6e}. "
-        f"Rotates around Z by theta(z) = {chi_sym} * 2pi * {n_turns} * (z + L/2)/L, "
-        f"for z in [-{L/2:.6e}, {L/2:.6e}]."
+
+    surface = dict(
+        implicit_body="R_inner^2 <= x^2 + y^2 + z^2 <= R_outer^2",
+        surfaces=[
+            _sphere_surf("outer_sphere", R_out),
+            _sphere_surf("inner_sphere", R_in),
+        ],
     )
-    
-    # ── Ограничивающий параллелепипед ─────────────────────────────
-    # При вращении эллипс описывает цилиндр диаметром D_major
-    bbox_x = D_major
-    bbox_y = D_major
-    bbox_z = L
-    
-    return shape_expr, params, equation, (bbox_x, bbox_y, bbox_z), "twisted_nanowire"
 
-# ---------------------------------------------------------------------------
-# Запись скрипта .mx3
-# ---------------------------------------------------------------------------
-MX3_TEMPLATE = textwrap.dedent("""\
-    // ---------------------------------------------------------------
-    // Автосгенерированный скрипт MuMax3  –  {shape_type}
-    // ---------------------------------------------------------------
-
-    // --- Сетка ---
-    SetGridSize({Nx}, {Ny}, {Nz})
-    SetCellSize(2e-9, 2e-9, 2e-9)
-
-    // --- Сглаживание краев ---
-    EdgeSmooth = 8
-
-    // --- Геометрия ---
-    SetGeom({shape_expr})
-
-    // --- Параметры материала ---
-    Msat  = {Msat}
-    Aex   = {Aex}
-    alpha = {alpha}
-
-    // --- Формат вывода ---
-    OutputFormat = OVF2_BINARY
-
-    // --- Начальная намагниченность (случайная, с сидом) ---
-    m = RandomMagSeed({seed})
-
-    // --- Релаксация к минимуму энергии ---
-    Relax()
-
-    // --- Сохранение релаксированной намагниченности ---
-    SaveAs(m, "m_relaxed")
-""")
+    bbox = (2 * R_out, 2 * R_out, 2 * R_out)
+    return geom, params, surface, bbox
 
 
-def write_mx3(
-    path: Path,
-    shape_type: str,
-    shape_expr: str,
-    Nx: int, Ny: int, Nz: int,
-    seed: int,
-):
-    content = MX3_TEMPLATE.format(
-        shape_type=shape_type,
-        Nx=Nx, Ny=Ny, Nz=Nz,
-        shape_expr=shape_expr,
-        Msat=MSAT,
-        Aex=AEX,
-        alpha=ALPHA,
-        seed=seed,
+def gen_chiral_nanowire(rng):
+    strand_r = rng.uniform(5e-9, 10e-9)
+    helix_r = rng.uniform(6e-9, 14e-9)
+    length = rng.uniform(80e-9, 180e-9)
+    pitch = rng.uniform(30e-9, min(70e-9, length / 1.5))
+    chirality = rng.choice([-1, 1])
+
+    core_r = max(CELL, helix_r * 0.3)
+
+    # Sphere spacing along z so that 3-D gap < strand_r (good overlap)
+    arc_k = math.sqrt(1 + (2 * math.pi * helix_r / pitch) ** 2)
+    dz = strand_r / arc_k
+    n_pts = max(2, int(math.ceil(length / dz)) + 1)
+
+    d = 2 * strand_r
+    half = length / 2
+
+    lines = [f"geo := Cylinder({fv(2*core_r)}, {fv(length)})"]
+    for i in range(n_pts):
+        t = i / (n_pts - 1)          # 0 → 1
+        z = -half + t * length
+        theta = chirality * 2 * math.pi * z / pitch
+
+        for offset in (0.0, math.pi):  # two strands
+            x = helix_r * math.cos(theta + offset)
+            y = helix_r * math.sin(theta + offset)
+            lines.append(
+                f"geo = geo.Add(Ellipsoid({fv(d)}, {fv(d)}, {fv(d)})"
+                f".Transl({fv(x)}, {fv(y)}, {fv(z)}))"
+            )
+
+    chi = "+" if chirality > 0 else "-"
+    params = dict(
+        shape_type="chiral_nanowire",
+        helix_radius_m=helix_r,
+        strand_radius_m=strand_r,
+        core_radius_m=core_r,
+        pitch_m=pitch,
+        length_m=length,
+        chirality=chirality,
+        n_points_per_strand=n_pts,
     )
-    path.write_text(content, encoding="utf-8")
+
+    surface = dict(
+        implicit_body=(
+            "min(dist(P,C1), dist(P,C2)) <= r_strand  "
+            "OR  (x^2+y^2 <= r_core^2 AND |z| <= L/2)"
+        ),
+        chirality=chirality,
+        centerlines=dict(
+            strand_1=dict(
+                type="helix",
+                parametric=dict(
+                    x=f"R_h*cos({chi}2*pi*t/P)",
+                    y=f"R_h*sin({chi}2*pi*t/P)",
+                    z="t",
+                    t_range=[-half, half],
+                ),
+                R_h=helix_r, P=pitch,
+            ),
+            strand_2=dict(
+                type="helix",
+                parametric=dict(
+                    x=f"R_h*cos({chi}2*pi*t/P + pi)",
+                    y=f"R_h*sin({chi}2*pi*t/P + pi)",
+                    z="t",
+                    t_range=[-half, half],
+                ),
+                R_h=helix_r, P=pitch,
+            ),
+        ),
+        core=dict(
+            type="cylinder", equation="x^2 + y^2 - r_core^2 = 0",
+            R=core_r, z_range=[-half, half],
+        ),
+        strand_tube=dict(
+            description="Tubular surface of radius r_strand around each helix centreline",
+            r_strand=strand_r,
+        ),
+    )
+
+    total_r = helix_r + strand_r
+    bbox = (2 * total_r, 2 * total_r, length)
+    return lines, params, surface, bbox
 
 
 # ---------------------------------------------------------------------------
-# Запись geometry_info.json
+# Main
 # ---------------------------------------------------------------------------
-def write_geometry_info(
-    path: Path,
-    shape_type: str,
-    params: dict[str, Any],
-    equation: str,
-    Nx: int, Ny: int, Nz: int,
-):
-    info = {
-        "shape_type": shape_type,
-        "parameters": params,
-        "grid": {
-            "Nx": Nx,
-            "Ny": Ny,
-            "Nz": Nz,
-            "cell_size_m": CELL_SIZE_M,
-        },
-        "surface_equation": equation,
-        "material": {
-            "Msat_A_per_m": MSAT,
-            "Aex_J_per_m": AEX,
-            "alpha": ALPHA,
-        },
-    }
-    path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-# ===================================================================
-# Главная точка входа
-# ===================================================================
-GENERATORS = [generate_nanotube, generate_torus, generate_hollow_sphere, generate_chiral_twisted_wire]
+GENERATORS = [gen_nanotube, gen_torus, gen_hollow_sphere, gen_chiral_nanowire]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Генерация папок с симуляциями MuMax3 для обучения GNN."
+    ap = argparse.ArgumentParser(
+        description="Generate magnetic nanostructure dataset for EGNN training",
     )
-    parser.add_argument(
-        "--num_samples", type=int, default=100,
-        help="Количество генерируемых конфигураций (по умолчанию: 100)",
-    )
-    parser.add_argument(
-        "--output_dir", type=str, default="dataset",
-        help="Корневая директория для вывода (по умолчанию: 'dataset')",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Главный случайный сид для воспроизводимости (по умолчанию: 42)",
-    )
-    args = parser.parse_args()
+    ap.add_argument("-n", "--num-sims", type=int, default=100,
+                    help="number of simulations (default: 100)")
+    ap.add_argument("-o", "--output-dir", type=str, default="dataset",
+                    help="output directory (default: dataset)")
+    ap.add_argument("-s", "--seed", type=int, default=42,
+                    help="random seed (default: 42)")
+    args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    output_root = Path(args.output_dir).resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
+    task_paths = []
 
-    task_lines: list[str] = []
+    for i in range(args.num_sims):
+        sim_name = f"sim_{i + 1:04d}"
+        sim_dir = os.path.join(args.output_dir, sim_name)
+        os.makedirs(sim_dir, exist_ok=True)
 
-    for idx in range(args.num_samples):
-        sim_name = f"sim_{idx:04d}"
-        sim_dir  = output_root / sim_name
-        sim_dir.mkdir(parents=True, exist_ok=True)
+        gen = rng.choice(GENERATORS)
+        geom_lines, params, analytical_surface, bbox = gen(rng)
+        nx, ny, nz = grid_dims(*bbox)
 
-        # Выбираем случайный тип геометрии
-        gen_func = rng.choice(GENERATORS)
-        shape_expr, params, equation, bbox, shape_type = gen_func(rng)
+        # Write sim.mx3
+        mx3 = build_mx3(nx, ny, nz, geom_lines, seed=i + 1)
+        with open(os.path.join(sim_dir, "sim.mx3"), "w") as f:
+            f.write(mx3)
 
-        # Вычисляем сетку, удобную для БПФ
-        Nx, Ny, Nz = compute_grid(*bbox)
-
-        # Уникальный сид для RandomMagSeed внутри MuMax3
-        mag_seed = rng.randint(1, 2**31 - 1)
-
-        # Записываем .mx3
-        write_mx3(
-            sim_dir / "sim.mx3",
-            shape_type=shape_type,
-            shape_expr=shape_expr,
-            Nx=Nx, Ny=Ny, Nz=Nz,
-            seed=mag_seed,
+        # Write geometry_info.json
+        info = dict(
+            shape_type=params["shape_type"],
+            parameters=params,
+            grid=dict(Nx=nx, Ny=ny, Nz=nz,
+                      cell_size_m=CELL, padding_m=PAD),
+            analytical_surface=analytical_surface,
         )
+        with open(os.path.join(sim_dir, "geometry_info.json"), "w") as f:
+            json.dump(info, f, indent=2)
 
-        # Записываем geometry_info.json
-        write_geometry_info(
-            sim_dir / "geometry_info.json",
-            shape_type=shape_type,
-            params=params,
-            equation=equation,
-            Nx=Nx, Ny=Ny, Nz=Nz,
-        )
+        task_paths.append(sim_dir)
+        print(f"[{i+1:4d}/{args.num_sims}] {sim_name}:  "
+              f"{params['shape_type']:20s}  grid {nx}x{ny}x{nz}")
 
-        task_lines.append(str(sim_dir))
+    # Write task list for SLURM
+    tasks_file = "tasks.txt"
+    with open(tasks_file, "w") as f:
+        for p in task_paths:
+            f.write(p + "\n")
 
-        print(f"[{idx+1:4d}/{args.num_samples}]  {sim_name}  ({shape_type})"
-              f"  grid=({Nx},{Ny},{Nz})")
-
-    # Записываем tasks.txt для SLURM
-    tasks_path = output_root / "tasks.txt"
-    tasks_path.write_text("\n".join(task_lines) + "\n", encoding="utf-8")
-
-    print(f"\nГотово. {args.num_samples} симуляций записано в {output_root}")
-    print(f"Список задач для SLURM: {tasks_path}")
+    print(f"\nDone. {args.num_sims} simulations in {args.output_dir}/")
+    print(f"SLURM task list: {tasks_file}")
 
 
 if __name__ == "__main__":

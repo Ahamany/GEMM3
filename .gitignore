@@ -1,6 +1,9 @@
 /api_mumax/
 dataset/
-*.out/
+.claude/
 
-*.mx3
-geometry_info.json
+/.claudeignore
+/CLAUDE.md
+/promts/
+/tasks.txt
+/__pycache__
