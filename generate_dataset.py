@@ -6,6 +6,12 @@ Creates sim_XXXX folders, each containing:
   - geometry_info.json : shape parameters + analytical surface equations
 
 Also writes tasks.txt for SLURM Job Array integration.
+
+Using
+-------------
+    python3 generate_dataset.py                        # 100 samples → ./dataset
+    python3 generate_dataset.py --num_samples 50 \\
+                                --output_dir test_dataset
 """
 
 import os
@@ -18,8 +24,7 @@ import argparse
 # Physical constants (fixed for all simulations)
 # ---------------------------------------------------------------------------
 CELL = 2e-9    # cell size  [m]
-PAD = 16e-9    # padding    [m] (8 cells per side)
-
+PAD = 16e-9    # padding    [m] (8 cells per side) 
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,13 +71,13 @@ def build_mx3(nx, ny, nz, geom_lines, seed):
     L.append("")
     L.append("// Geometry")
     L.extend(geom_lines)
-    L.append("EdgeSmooth = 8")
+    L.append("EdgeSmooth = 8")          # Edge Smooth
     L.append("SetGeom(geo)")
     L.append("")
     L.append("// Material parameters")
-    L.append("Msat  = 8e5")
-    L.append("Aex   = 1.3e-11")
-    L.append("alpha = 0.5")
+    L.append("Msat  = 8e5")             # A/m – saturation magnetization
+    L.append("Aex   = 1.3e-11")         # J/m – exchange interaction constant
+    L.append("alpha = 0.5")             # Hilbert damping
     L.append("")
     L.append("// Random initial magnetization")
     L.append(f"m = RandomMagSeed({seed})")

@@ -1,5 +1,5 @@
 /api_mumax/
-dataset/
+/dataset/
 .claude/
 
 /.claudeignore
@@ -7,3 +7,5 @@ dataset/
 /promts/
 /tasks.txt
 /__pycache__
+/.idea/
+/graphs/
