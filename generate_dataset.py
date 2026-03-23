@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate training dataset of magnetic nanostructure configurations for EGNN.
+"""Generate training dataset of chiral nanowire configurations for EGNN.
 
 Creates sim_XXXX folders, each containing:
   - sim.mx3       : Mumax3 simulation script
@@ -97,149 +97,17 @@ def build_mx3(nx, ny, nz, geom_lines, seed):
 # ---------------------------------------------------------------------------
 # Each returns (geom_lines, params_dict, analytical_surface_dict, bbox_tuple)
 
-
-def gen_nanotube(rng):
-    R_out = rng.uniform(15e-9, 40e-9)
-    wall = rng.uniform(6e-9, min(20e-9, R_out - 4e-9))
-    R_in = R_out - wall
-    length = rng.uniform(40e-9, 120e-9)
-
-    geom = [
-        f"geo := Cylinder({fv(2*R_out)}, {fv(length)})"
-        f".Sub(Cylinder({fv(2*R_in)}, {fv(length)}))",
-    ]
-
-    params = dict(
-        shape_type="nanotube",
-        R_outer_m=R_out,
-        R_inner_m=R_in,
-        length_m=length,
-        wall_thickness_m=wall,
-    )
-
-    surface = dict(
-        implicit_body="R_inner^2 <= x^2 + y^2 <= R_outer^2  AND  |z| <= L/2",
-        surfaces=[
-            dict(name="outer_cylinder", type="cylinder",
-                 equation="x^2 + y^2 - R_outer^2 = 0",
-                 axis="z", R=R_out,
-                 z_range=[-length / 2, length / 2]),
-            dict(name="inner_cylinder", type="cylinder",
-                 equation="x^2 + y^2 - R_inner^2 = 0",
-                 axis="z", R=R_in,
-                 z_range=[-length / 2, length / 2]),
-            dict(name="top_cap", type="annular_disk",
-                 equation="z - L/2 = 0",
-                 z=length / 2, R_inner=R_in, R_outer=R_out),
-            dict(name="bottom_cap", type="annular_disk",
-                 equation="z + L/2 = 0",
-                 z=-length / 2, R_inner=R_in, R_outer=R_out),
-        ],
-    )
-
-    bbox = (2 * R_out, 2 * R_out, length)
-    return geom, params, surface, bbox
-
-
-def gen_torus(rng):
-    R = rng.uniform(20e-9, 50e-9)
-    r = rng.uniform(8e-9, min(20e-9, R - 4e-9))
-
-    N = max(36, int(math.ceil(2 * math.pi * R / r)))
-    d = 2 * r
-
-    lines = []
-    for i in range(N):
-        a = i * 2 * math.pi / N
-        x = R * math.cos(a)
-        y = R * math.sin(a)
-        sphere = f"Ellipsoid({fv(d)}, {fv(d)}, {fv(d)}).Transl({fv(x)}, {fv(y)}, 0)"
-        if i == 0:
-            lines.append(f"geo := {sphere}")
-        else:
-            lines.append(f"geo = geo.Add({sphere})")
-
-    params = dict(
-        shape_type="torus",
-        R_major_m=R,
-        r_minor_m=r,
-        N_csg_spheres=N,
-    )
-
-    surface = dict(
-        implicit_body="(sqrt(x^2 + y^2) - R_major)^2 + z^2 <= r_minor^2",
-        surfaces=[
-            dict(
-                name="torus_surface", type="torus",
-                equation="(sqrt(x^2 + y^2) - R_major)^2 + z^2 - r_minor^2 = 0",
-                R_major=R, r_minor=r,
-                parametric=dict(
-                    x="(R_major + r_minor*cos(v))*cos(u)",
-                    y="(R_major + r_minor*cos(v))*sin(u)",
-                    z="r_minor*sin(v)",
-                    u_range=[0, "2*pi"], v_range=[0, "2*pi"],
-                ),
-            ),
-        ],
-    )
-
-    bbox = (2 * (R + r), 2 * (R + r), 2 * r)
-    return lines, params, surface, bbox
-
-
-def gen_hollow_sphere(rng):
-    R_out = rng.uniform(20e-9, 50e-9)
-    wall = rng.uniform(6e-9, min(25e-9, R_out - 4e-9))
-    R_in = R_out - wall
-
-    d_out, d_in = 2 * R_out, 2 * R_in
-    geom = [
-        f"geo := Ellipsoid({fv(d_out)}, {fv(d_out)}, {fv(d_out)})"
-        f".Sub(Ellipsoid({fv(d_in)}, {fv(d_in)}, {fv(d_in)}))",
-    ]
-
-    params = dict(
-        shape_type="hollow_sphere",
-        R_outer_m=R_out,
-        R_inner_m=R_in,
-        wall_thickness_m=wall,
-    )
-
-    def _sphere_surf(name, R_val):
-        return dict(
-            name=name, type="sphere",
-            equation=f"x^2 + y^2 + z^2 - R^2 = 0",
-            R=R_val,
-            parametric=dict(
-                x="R*sin(theta)*cos(phi)",
-                y="R*sin(theta)*sin(phi)",
-                z="R*cos(theta)",
-                theta_range=[0, "pi"], phi_range=[0, "2*pi"],
-            ),
-        )
-
-    surface = dict(
-        implicit_body="R_inner^2 <= x^2 + y^2 + z^2 <= R_outer^2",
-        surfaces=[
-            _sphere_surf("outer_sphere", R_out),
-            _sphere_surf("inner_sphere", R_in),
-        ],
-    )
-
-    bbox = (2 * R_out, 2 * R_out, 2 * R_out)
-    return geom, params, surface, bbox
-
-
 def gen_chiral_nanowire(rng):
-    strand_r = rng.uniform(5e-9, 10e-9)
-    helix_r = rng.uniform(6e-9, 14e-9)
-    length = rng.uniform(80e-9, 180e-9)
-    pitch = rng.uniform(30e-9, min(70e-9, length / 1.5))
+    strand_r = rng.uniform(5e-9, 15e-9)
+    # helix_r <= strand_r guarantees the strands reach the twist axis
+    # (no central void) and that the two strands are mutually tangent or
+    # overlapping — the defining property of a tight twisted pair.
+    helix_r = rng.uniform(0.6 * strand_r, strand_r)
+    length = rng.uniform(80e-9, 200e-9)
+    pitch = rng.uniform(20e-9, min(60e-9, length / 1.5))
     chirality = rng.choice([-1, 1])
 
-    core_r = max(CELL, helix_r * 0.3)
-
-    # Sphere spacing along z so that 3-D gap < strand_r (good overlap)
+    # Sphere spacing along z so that 3-D arc step < strand_r (solid overlap)
     arc_k = math.sqrt(1 + (2 * math.pi * helix_r / pitch) ** 2)
     dz = strand_r / arc_k
     n_pts = max(2, int(math.ceil(length / dz)) + 1)
@@ -247,26 +115,29 @@ def gen_chiral_nanowire(rng):
     d = 2 * strand_r
     half = length / 2
 
-    lines = [f"geo := Cylinder({fv(2*core_r)}, {fv(length)})"]
+    lines = []
+    first = True
     for i in range(n_pts):
         t = i / (n_pts - 1)          # 0 → 1
         z = -half + t * length
         theta = chirality * 2 * math.pi * z / pitch
 
-        for offset in (0.0, math.pi):  # two strands
+        for offset in (0.0, math.pi):  # two strands, 180° apart
             x = helix_r * math.cos(theta + offset)
             y = helix_r * math.sin(theta + offset)
-            lines.append(
-                f"geo = geo.Add(Ellipsoid({fv(d)}, {fv(d)}, {fv(d)})"
-                f".Transl({fv(x)}, {fv(y)}, {fv(z)}))"
-            )
+            sphere = (f"Ellipsoid({fv(d)}, {fv(d)}, {fv(d)})"
+                      f".Transl({fv(x)}, {fv(y)}, {fv(z)})")
+            if first:
+                lines.append(f"geo := {sphere}")
+                first = False
+            else:
+                lines.append(f"geo = geo.Add({sphere})")
 
     chi = "+" if chirality > 0 else "-"
     params = dict(
         shape_type="chiral_nanowire",
         helix_radius_m=helix_r,
         strand_radius_m=strand_r,
-        core_radius_m=core_r,
         pitch_m=pitch,
         length_m=length,
         chirality=chirality,
@@ -274,10 +145,7 @@ def gen_chiral_nanowire(rng):
     )
 
     surface = dict(
-        implicit_body=(
-            "min(dist(P,C1), dist(P,C2)) <= r_strand  "
-            "OR  (x^2+y^2 <= r_core^2 AND |z| <= L/2)"
-        ),
+        implicit_body="min(dist(P,C1), dist(P,C2)) <= r_strand",
         chirality=chirality,
         centerlines=dict(
             strand_1=dict(
@@ -301,10 +169,6 @@ def gen_chiral_nanowire(rng):
                 R_h=helix_r, P=pitch,
             ),
         ),
-        core=dict(
-            type="cylinder", equation="x^2 + y^2 - r_core^2 = 0",
-            R=core_r, z_range=[-half, half],
-        ),
         strand_tube=dict(
             description="Tubular surface of radius r_strand around each helix centreline",
             r_strand=strand_r,
@@ -319,7 +183,7 @@ def gen_chiral_nanowire(rng):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-GENERATORS = [gen_nanotube, gen_torus, gen_hollow_sphere, gen_chiral_nanowire]
+GENERATORS = [gen_chiral_nanowire]
 
 
 def main():

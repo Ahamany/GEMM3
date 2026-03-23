@@ -5,11 +5,11 @@ The project is dedicated to developing a high-precision machine learning pipelin
 The governing dynamics of magnetic nanostructures are described by the Landau-Lifshitz-Gilbert (LLG) equation.
 * Traditional methods solve this equation iteratively over time, which requires enormous computational resources for large 3D systems.
 * Standard solvers, such as OOMMF and Mumax3, use finite difference methods (FDM).
-* On curved surfaces, the application of FDM creates a "staircase effect," leading to physical artifacts and an exponential slowdown in computations.
+* On curved surfaces (such as chiral nanowires), the application of FDM creates a "staircase effect," leading to physical artifacts and an exponential slowdown in computations.
 
 ### Scientific Novelty and Theoretical Foundation
 As a solution, the use of an E(3)-equivariant graph neural network is proposed.
-* **Geometric Deep Learning:** Instead of voxel grids, data is represented as graphs. This allows for natural processing of any 3D shapes (spheres, tori, tubes), completely avoiding the "staircase effect."
+* **Geometric Deep Learning:** Instead of voxel grids, data is represented as graphs. This allows for natural processing of complex 3D shapes (such as chiral nanowires), completely avoiding the "staircase effect."
 * **E(3)-Equivariance:** This critical property ensures that when a physical structure is rotated, the predicted vector field rotates with it, preserving physical validity.
 * This approach bypasses the limitations of grid-based solvers and offers a new paradigm for "Inverse Design."
 
@@ -43,7 +43,7 @@ The project is divided into several phases:
 
 ### `generate_dataset.py`
 
-Generates a synthetic dataset of magnetic nanostructure simulation inputs for EGNN training. For each sample, the script randomly selects one of four shape types — **nanotube**, **torus**, **hollow sphere**, or **chiral nanowire** — with randomised geometric parameters. It then produces:
+Generates a synthetic dataset of chiral nanowire simulation inputs for EGNN training. For each sample, the script generates a **chiral nanowire** with randomised geometric parameters (helix radius, strand radius, pitch, length, chirality). It then produces:
 
 - **`sim.mx3`** — A complete Mumax3 simulation script with FFT-friendly grid dimensions, edge smoothing (`EdgeSmooth = 8`), permalloy-like material parameters (Msat = 8e5 A/m, Aex = 1.3e-11 J/m), random initial magnetisation, and a `Relax()` energy minimisation step.
 - **`geometry_info.json`** — Shape parameters, grid metadata, and analytical surface equations (implicit form + parametric form where applicable). This file is consumed downstream by `voxel_to_graph.py` for geometric projection.
@@ -65,11 +65,9 @@ The script also writes a `tasks.txt` file listing all simulation directories, in
 Converts Mumax3 simulation output (OVF2 binary voxel data) into PyTorch Geometric graph objects. This is the core artifact-correction step of the pipeline. The script:
 
 1. **Parses OVF2 binary files** — Reads the header for grid dimensions and cell sizes, decodes the float32 payload, and computes origin-centred voxel coordinates. Empty cells (vacuum) are discarded.
-2. **Projects voxel centres onto analytical surfaces** — Uses the shape equations from `geometry_info.json` to map discretised voxel positions onto the ideal continuous surface, eliminating the FDM "staircase effect." Four projector types are implemented:
-   - **NanotubeProjector** — Closed-form projection onto 4 surfaces (outer/inner cylinder walls + top/bottom annular caps).
-   - **HollowSphereProjector** — Closed-form radial projection onto outer/inner concentric spheres.
-   - **ParametricOptimizerProjector** — Gradient-based (L-BFGS) projection for torus and chiral nanowire shapes, using parametric surface equations and `torch.autograd` for surface normal computation.
-3. **Computes surface normals** — Analytical normals for simple shapes; autograd cross-product of parametric partials (dS/dp0 x dS/dp1) for complex shapes.
+2. **Projects voxel centres onto analytical surfaces** — Uses the shape equations from `geometry_info.json` to map discretised voxel positions onto the ideal continuous surface, eliminating the FDM "staircase effect." The projector is implemented as:
+   - **ChiralNanowireProjector** — Gradient-based (L-BFGS) projection using the closed-form Frenet frame of helix centrelines plus analytical cylinder projection for the core. Surface normals computed via `torch.autograd` cross-product of parametric partials (dS/dp0 x dS/dp1).
+3. **Computes surface normals** — Autograd cross-product of parametric partials (dS/dp0 x dS/dp1).
 4. **Assembles PyG `Data` objects** — Each graph contains node positions (`pos`), a feature matrix `x` of shape [N, 6] (magnetisation `[mx, my, mz]` + surface normals `[nx, ny, nz]`), and an `edge_index` built via radius graph.
 
 **Arguments:**
@@ -203,5 +201,4 @@ python visualize_graph.py graphs/sim_0042.pt --vectors none
   - `numpy`
   - `torch`
   - `torch_geometric`
-  - `sympy`
-  - `plotly`
+    - `plotly`

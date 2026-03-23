@@ -6,9 +6,9 @@ vector arrows (normals or magnetisation) and edge overlay.
 
 Usage
 -----
-    python visualize_graph.py graphs/sim_0001.pt
-    python visualize_graph.py graphs/sim_0010.pt --color-by mx --vectors mag
-    python visualize_graph.py graphs/sim_0008.pt --cone --max-cones 3000
+    python3 visualize_graph.py graphs/sim_0001.pt
+    python3 visualize_graph.py graphs/sim_0010.pt --color-by mx --vectors mag
+    python3 visualize_graph.py graphs/sim_0008.pt --cone --max-cones 3000
 """
 
 import argparse
@@ -143,7 +143,7 @@ def make_vector_cones(pos: np.ndarray, vecs: np.ndarray, colors: np.ndarray,
         colorscale=colorscale,
         cmin=-1, cmax=1,
         sizemode="absolute",
-        sizeref=arrow_len * 0.4,
+        sizeref=arrow_len * 5,
         showscale=False,
         name=label,
     )
@@ -308,12 +308,12 @@ def main():
         help="Max nodes to render, 0 = all (default: 0)",
     )
     parser.add_argument(
-        "--max-edges", type=int, default=5000,
-        help="Max edges to render, 0 = skip (default: 5000)",
+        "--max-edges", type=int, default=2000,
+        help="Max edges to render, 0 = skip (default: 2000)",
     )
     parser.add_argument(
-        "--max-cones", type=int, default=2000,
-        help="Max cone glyphs when --cone is used (default: 2000)",
+        "--max-cones", type=int, default=5000,
+        help="Max cone glyphs when --cone is used (default: 5000)",
     )
 
     args = parser.parse_args()

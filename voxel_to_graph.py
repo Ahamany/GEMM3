@@ -3,15 +3,13 @@
 
 Pipeline:
   1. Parse OVF2 binary → voxel positions + magnetization vectors
-  2. Project voxel centers onto ideal analytical surfaces (hybrid approach)
-  3. Compute surface normals (analytical or via autograd)
+  2. Project voxel centers onto ideal analytical surfaces (gradient-based)
+  3. Compute surface normals via autograd
   4. Assemble PyTorch Geometric Data objects
 
 Projector hierarchy:
   BaseProjector (ABC)
-  ├── NanotubeProjector          — closed-form (4 surfaces)
-  ├── HollowSphereProjector     — closed-form (2 surfaces)
-  └── ParametricOptimizerProjector — gradient-based (torus, chiral nanowire)
+  └── ChiralNanowireProjector — gradient-based (L-BFGS + Frenet frame)
 """
 
 import json
@@ -21,7 +19,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
-import sympy as sp
 import torch
 from torch_geometric.data import Data
 from torch_geometric.nn import radius_graph
@@ -156,206 +153,22 @@ class BaseProjector(ABC):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 2a: NanotubeProjector (analytical)
+# Section 2a: ChiralNanowireProjector (gradient-based)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class NanotubeProjector(BaseProjector):
-    """Closed-form projection onto a hollow cylinder (nanotube).
+class ChiralNanowireProjector(BaseProjector):
+    """Gradient-based projection for chiral nanowire surfaces.
 
-    Four surfaces: outer cylinder wall, inner cylinder wall, top cap,
-    bottom cap.  Each voxel is projected onto its nearest surface.
-    """
-
-    def __init__(self, R_outer: float, R_inner: float, length: float):
-        self.R_outer = R_outer
-        self.R_inner = R_inner
-        self.half_L = length / 2.0
-
-    def project(self, P_voxel: torch.Tensor):
-        x, y, z = P_voxel[:, 0], P_voxel[:, 1], P_voxel[:, 2]
-        rho = torch.sqrt(x ** 2 + y ** 2).clamp(min=1e-15)
-        cos_phi = x / rho
-        sin_phi = y / rho
-
-        hL = self.half_L
-        Ro, Ri = self.R_outer, self.R_inner
-
-        # --- closest point on each surface ---
-        z_clamp = z.clamp(-hL, hL)
-        rho_clamp = rho.clamp(Ri, Ro)
-
-        # outer cylinder: (Ro*cos, Ro*sin, z_clamp)
-        p_outer = torch.stack([Ro * cos_phi, Ro * sin_phi, z_clamp], dim=-1)
-        d_outer = (P_voxel - p_outer).norm(dim=-1)
-
-        # inner cylinder: (Ri*cos, Ri*sin, z_clamp)
-        p_inner = torch.stack([Ri * cos_phi, Ri * sin_phi, z_clamp], dim=-1)
-        d_inner = (P_voxel - p_inner).norm(dim=-1)
-
-        # top cap: (rho_clamp*cos, rho_clamp*sin, +hL)
-        p_top = torch.stack([rho_clamp * cos_phi, rho_clamp * sin_phi,
-                             torch.full_like(z, hL)], dim=-1)
-        d_top = (P_voxel - p_top).norm(dim=-1)
-
-        # bottom cap: (rho_clamp*cos, rho_clamp*sin, -hL)
-        p_bot = torch.stack([rho_clamp * cos_phi, rho_clamp * sin_phi,
-                             torch.full_like(z, -hL)], dim=-1)
-        d_bot = (P_voxel - p_bot).norm(dim=-1)
-
-        # --- pick nearest surface per point ---
-        dists = torch.stack([d_outer, d_inner, d_top, d_bot], dim=-1)
-        labels = dists.argmin(dim=-1)  # 0=outer, 1=inner, 2=top, 3=bot
-
-        N = P_voxel.shape[0]
-        P_ideal = torch.zeros_like(P_voxel)
-        normals = torch.zeros_like(P_voxel)
-
-        # outer cylinder
-        m_out = labels == 0
-        if m_out.any():
-            P_ideal[m_out] = p_outer[m_out]
-            normals[m_out] = torch.stack(
-                [cos_phi[m_out], sin_phi[m_out], torch.zeros(m_out.sum())],
-                dim=-1,
-            )
-
-        # inner cylinder (normal points inward = toward axis)
-        m_in = labels == 1
-        if m_in.any():
-            P_ideal[m_in] = p_inner[m_in]
-            normals[m_in] = torch.stack(
-                [-cos_phi[m_in], -sin_phi[m_in], torch.zeros(m_in.sum())],
-                dim=-1,
-            )
-
-        # top cap
-        m_top = labels == 2
-        if m_top.any():
-            P_ideal[m_top] = p_top[m_top]
-            normals[m_top, 2] = 1.0
-
-        # bottom cap
-        m_bot = labels == 3
-        if m_bot.any():
-            P_ideal[m_bot] = p_bot[m_bot]
-            normals[m_bot, 2] = -1.0
-
-        return P_ideal, normals
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Section 2b: HollowSphereProjector (analytical)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class HollowSphereProjector(BaseProjector):
-    """Closed-form projection onto a hollow sphere (two concentric spheres).
-
-    Assignment: if |r| > midpoint radius → outer sphere, else → inner.
-    """
-
-    def __init__(self, R_outer: float, R_inner: float):
-        self.R_outer = R_outer
-        self.R_inner = R_inner
-        self.R_mid = (R_outer + R_inner) / 2.0
-
-    def project(self, P_voxel: torch.Tensor):
-        r = P_voxel.norm(dim=-1, keepdim=True).clamp(min=1e-15)
-        direction = P_voxel / r  # unit radial vector
-
-        is_outer = (r.squeeze(-1) >= self.R_mid)
-
-        P_ideal = torch.zeros_like(P_voxel)
-        normals = torch.zeros_like(P_voxel)
-
-        # outer sphere
-        if is_outer.any():
-            P_ideal[is_outer] = self.R_outer * direction[is_outer]
-            normals[is_outer] = direction[is_outer]  # outward
-
-        # inner sphere (normal points inward = toward centre)
-        is_inner = ~is_outer
-        if is_inner.any():
-            P_ideal[is_inner] = self.R_inner * direction[is_inner]
-            normals[is_inner] = -direction[is_inner]  # inward
-
-        return P_ideal, normals
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Section 2c: ParametricOptimizerProjector (gradient-based)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# torch-compatible math module for sympy.lambdify
-_TORCH_MODULE = {
-    "sin": torch.sin,
-    "cos": torch.cos,
-    "sqrt": torch.sqrt,
-    "Abs": torch.abs,
-    "acos": torch.acos,
-    "asin": torch.asin,
-    "atan2": torch.atan2,
-    "pi": torch.pi,
-    "exp": torch.exp,
-    "log": torch.log,
-}
-
-
-def _parse_parametric_surface(parametric: dict, constants: dict):
-    """Parse a JSON parametric block into torch-callable functions.
-
-    Returns
-    -------
-    surf_fn : callable(param0, param1) → Tensor [N, 3]
-        Evaluates S(p0, p1) for N-length parameter tensors.
-    param_names : list[str]
-        Names of the two free parameters (e.g. ['u', 'v']).
-    param_ranges : list[tuple[float, float]]
-        (lo, hi) bounds for each parameter.
-    """
-    # identify parameters (keys ending with _range)
-    param_names = []
-    param_ranges = []
-    for key in sorted(parametric.keys()):
-        if key.endswith("_range"):
-            name = key[: -len("_range")]
-            param_names.append(name)
-            lo, hi = parametric[key]
-            lo = float(sp.sympify(lo)) if isinstance(lo, str) else float(lo)
-            hi = float(sp.sympify(hi)) if isinstance(hi, str) else float(hi)
-            param_ranges.append((lo, hi))
-
-    syms = sp.symbols(param_names)
-    sym_map = {n: s for n, s in zip(param_names, syms)}
-
-    fns = []
-    for coord in ("x", "y", "z"):
-        expr = sp.sympify(parametric[coord], locals=sym_map)
-        expr = expr.subs(constants)
-        fns.append(sp.lambdify(syms, expr, modules=[_TORCH_MODULE, "math"]))
-
-    def surf_fn(p0, p1):
-        return torch.stack([fns[0](p0, p1), fns[1](p0, p1), fns[2](p0, p1)],
-                           dim=-1)
-
-    return surf_fn, param_names, param_ranges
-
-
-class ParametricOptimizerProjector(BaseProjector):
-    """Gradient-based projection for surfaces with parametric equations.
-
-    Handles two cases:
-      (a) Standard 2D parametric (torus): parsed from JSON ``parametric`` dict.
-      (b) Helix-tube (chiral nanowire): tube surface around helix centrelines
-          built directly in torch using the closed-form Frenet frame, plus
-          analytical projection for the core cylinder.
+    Helix-tube surface around helix centrelines built directly in torch
+    using the closed-form Frenet frame, plus analytical projection for
+    the core cylinder.
 
     Optimiser: L-BFGS (vectorised over all N points simultaneously).
     Normals:   dS/dp0 × dS/dp1 via ``torch.autograd``.
     """
 
-    def __init__(self, analytical_surface: dict, shape_type: str,
+    def __init__(self, analytical_surface: dict,
                  lr: float = 1.0, num_steps: int = 60, max_iter: int = 20):
-        self.shape_type = shape_type
         self.lr = lr
         self.num_steps = num_steps
         self.max_iter = max_iter
@@ -366,66 +179,6 @@ class ParametricOptimizerProjector(BaseProjector):
         """Characteristic length for normalisation (keeps loss O(1))."""
         return float(P.abs().max().clamp(min=1e-15))
 
-    # ------------------------------------------------------------------
-    # Torus
-    # ------------------------------------------------------------------
-    def _project_torus(self, P_voxel: torch.Tensor):
-        surface = self.analytical_surface["surfaces"][0]
-        constants = {k: v for k, v in surface.items()
-                     if isinstance(v, (int, float))}
-
-        P = P_voxel.double()
-        scale = self._length_scale(P)
-
-        # scale constants so the parametric surface lives in O(1) space
-        scaled_constants = {
-            k: v / scale if isinstance(v, float) else v
-            for k, v in constants.items()
-        }
-        surf_fn, param_names, param_ranges = _parse_parametric_surface(
-            surface["parametric"], scaled_constants,
-        )
-
-        P_norm = P / scale
-        x, y, z = P_norm[:, 0], P_norm[:, 1], P_norm[:, 2]
-
-        R_major = constants.get("R_major", constants.get("R")) / scale
-
-        # smart initial guess
-        u0 = torch.atan2(y, x)
-        rho = torch.sqrt(x ** 2 + y ** 2)
-        v0 = torch.atan2(z, rho - R_major)
-
-        params_u = u0.clone().requires_grad_(True)
-        params_v = v0.clone().requires_grad_(True)
-
-        optimizer = torch.optim.LBFGS(
-            [params_u, params_v], lr=self.lr, max_iter=self.max_iter,
-            line_search_fn="strong_wolfe",
-        )
-
-        def closure():
-            optimizer.zero_grad()
-            S = surf_fn(params_u, params_v)
-            loss = ((S - P_norm) ** 2).sum()
-            loss.backward()
-            return loss
-
-        for _ in range(self.num_steps):
-            optimizer.step(closure)
-
-        # denormalise: build unscaled surface function for normals
-        orig_fn, _, _ = _parse_parametric_surface(
-            surface["parametric"], constants,
-        )
-        P_ideal, normals = self._normals_from_autograd(
-            orig_fn, params_u, params_v, P,
-        )
-        return P_ideal.float(), normals.float()
-
-    # ------------------------------------------------------------------
-    # Chiral nanowire
-    # ------------------------------------------------------------------
     @staticmethod
     def _build_helix_tube_fn(strand_info: dict, r_strand: float,
                              scale: float = 1.0):
@@ -704,16 +457,8 @@ class ParametricOptimizerProjector(BaseProjector):
 
         return S.detach(), normals.detach()
 
-    # ------------------------------------------------------------------
-    # Dispatch
-    # ------------------------------------------------------------------
     def project(self, P_voxel: torch.Tensor):
-        if self.shape_type == "torus":
-            return self._project_torus(P_voxel)
-        elif self.shape_type == "chiral_nanowire":
-            return self._project_chiral(P_voxel)
-        else:
-            raise ValueError(f"Unsupported shape type: {self.shape_type}")
+        return self._project_chiral(P_voxel)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -723,25 +468,10 @@ class ParametricOptimizerProjector(BaseProjector):
 def projector_factory(geometry_info: dict) -> BaseProjector:
     """Instantiate the correct projector from a geometry_info.json dict."""
     shape = geometry_info["shape_type"]
-    params = geometry_info["parameters"]
     surface = geometry_info["analytical_surface"]
 
-    if shape == "nanotube":
-        return NanotubeProjector(
-            R_outer=params["R_outer_m"],
-            R_inner=params["R_inner_m"],
-            length=params["length_m"],
-        )
-    elif shape == "hollow_sphere":
-        return HollowSphereProjector(
-            R_outer=params["R_outer_m"],
-            R_inner=params["R_inner_m"],
-        )
-    elif shape in ("torus", "chiral_nanowire"):
-        return ParametricOptimizerProjector(
-            analytical_surface=surface,
-            shape_type=shape,
-        )
+    if shape == "chiral_nanowire":
+        return ChiralNanowireProjector(analytical_surface=surface)
     else:
         raise ValueError(f"Unknown shape type: {shape}")
 
