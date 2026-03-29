@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import plotly.graph_objects as go
+import pyvista as pv
 
 # ── Feature channel mapping ─────────────────────────────────────────────────
 
@@ -65,117 +65,69 @@ def _try_load_shape_type(pt_path: Path) -> str:
     return "unknown"
 
 
-# ── Trace builders ───────────────────────────────────────────────────────────
+# ── Mesh builders ───────────────────────────────────────────────────────────
 
-def make_node_trace(pos: np.ndarray, colors: np.ndarray, features: np.ndarray,
-                    colorscale: str) -> go.Scatter3d:
-    """Scatter3d trace for graph nodes."""
-    hover = []
-    labels = ["mx", "my", "mz", "nx", "ny", "nz"]
-    for i in range(pos.shape[0]):
-        vals = "  ".join(f"{labels[j]}={features[i, j]:+.3f}" for j in range(6))
-        hover.append(f"node {i}<br>{vals}")
-
-    return go.Scatter3d(
-        x=pos[:, 0], y=pos[:, 1], z=pos[:, 2],
-        mode="markers",
-        marker=dict(
-            size=2,
-            color=colors,
-            colorscale=colorscale,
-            cmin=-1, cmax=1,
-            colorbar=dict(title="value", thickness=15),
-        ),
-        hovertext=hover,
-        hoverinfo="text",
-        name="Nodes",
-    )
+def make_node_mesh(pos_nm: np.ndarray, scalars: np.ndarray,
+                   scalar_name: str) -> pv.PolyData:
+    """Point cloud mesh with a named scalar array."""
+    mesh = pv.PolyData(pos_nm)
+    mesh[scalar_name] = scalars
+    return mesh
 
 
-def make_vector_lines(pos: np.ndarray, vecs: np.ndarray, colors: np.ndarray,
-                      arrow_len: float, colorscale: str,
-                      label: str) -> go.Scatter3d:
-    """Line-segment arrows from pos to pos + arrow_len * vec."""
-    tips = pos + arrow_len * vecs
-    n = pos.shape[0]
-
-    # interleave base, tip, None for each segment
-    xs = np.empty(n * 3)
-    ys = np.empty(n * 3)
-    zs = np.empty(n * 3)
-    xs[0::3] = pos[:, 0];  xs[1::3] = tips[:, 0];  xs[2::3] = np.nan
-    ys[0::3] = pos[:, 1];  ys[1::3] = tips[:, 1];  ys[2::3] = np.nan
-    zs[0::3] = pos[:, 2];  zs[1::3] = tips[:, 2];  zs[2::3] = np.nan
-
-    # per-segment colour (repeat base colour for base, tip, gap)
-    seg_colors = np.repeat(colors, 3)
-
-    return go.Scatter3d(
-        x=xs, y=ys, z=zs,
-        mode="lines",
-        line=dict(
-            color=seg_colors,
-            colorscale=colorscale,
-            cmin=-1, cmax=1,
-            width=2,
-        ),
-        hoverinfo="skip",
-        name=label,
-    )
+def make_vector_line_mesh(pos_nm: np.ndarray, vecs: np.ndarray,
+                          arrow_len: float, scalars: np.ndarray,
+                          scalar_name: str) -> pv.PolyData:
+    """Line-segment arrows from each node to pos + arrow_len * vec."""
+    tips = pos_nm + arrow_len * vecs
+    n = pos_nm.shape[0]
+    all_points = np.vstack([pos_nm, tips])
+    cells = np.column_stack([
+        np.full(n, 2, dtype=np.int64),
+        np.arange(n, dtype=np.int64),
+        np.arange(n, 2 * n, dtype=np.int64),
+    ]).ravel()
+    mesh = pv.PolyData(all_points, lines=cells)
+    mesh[scalar_name] = np.concatenate([scalars, scalars])
+    return mesh
 
 
-def make_vector_cones(pos: np.ndarray, vecs: np.ndarray, colors: np.ndarray,
-                      arrow_len: float, colorscale: str, label: str,
-                      max_cones: int, rng: np.random.Generator) -> go.Cone:
-    """Cone glyphs for vector arrows (subsampled)."""
-    n = pos.shape[0]
+def make_vector_glyph_mesh(pos_nm: np.ndarray, vecs: np.ndarray,
+                           arrow_len: float, scalars: np.ndarray,
+                           scalar_name: str, max_cones: int,
+                           rng: np.random.Generator) -> pv.PolyData:
+    """Arrow glyphs oriented by vector field (subsampled)."""
+    n = pos_nm.shape[0]
     if n > max_cones:
         idx = _subsample_indices(n, max_cones, rng)
-        pos = pos[idx]
+        pos_nm = pos_nm[idx]
         vecs = vecs[idx]
-        colors = colors[idx]
+        scalars = scalars[idx]
 
-    scaled = arrow_len * vecs
-
-    return go.Cone(
-        x=pos[:, 0], y=pos[:, 1], z=pos[:, 2],
-        u=scaled[:, 0], v=scaled[:, 1], w=scaled[:, 2],
-        colorscale=colorscale,
-        cmin=-1, cmax=1,
-        sizemode="absolute",
-        sizeref=arrow_len * 5,
-        showscale=False,
-        name=label,
+    mesh = pv.PolyData(pos_nm)
+    mesh["vectors"] = vecs
+    mesh[scalar_name] = scalars
+    glyphs = mesh.glyph(
+        orient="vectors", scale=False, factor=arrow_len, geom=pv.Arrow(),
     )
+    return glyphs
 
 
-def make_edge_trace(pos: np.ndarray, edge_index: np.ndarray,
-                    max_edges: int, rng: np.random.Generator) -> go.Scatter3d:
-    """Thin grey lines for graph edges (subsampled)."""
+def make_edge_mesh(pos_nm: np.ndarray, edge_index: np.ndarray,
+                   max_edges: int, rng: np.random.Generator) -> pv.PolyData:
+    """Line mesh for graph edges (subsampled)."""
     n_edges = edge_index.shape[1]
     if n_edges > max_edges:
         idx = _subsample_indices(n_edges, max_edges, rng)
         edge_index = edge_index[:, idx]
         n_edges = max_edges
 
-    src = edge_index[0]
-    dst = edge_index[1]
-
-    xs = np.empty(n_edges * 3)
-    ys = np.empty(n_edges * 3)
-    zs = np.empty(n_edges * 3)
-    xs[0::3] = pos[src, 0];  xs[1::3] = pos[dst, 0];  xs[2::3] = np.nan
-    ys[0::3] = pos[src, 1];  ys[1::3] = pos[dst, 1];  ys[2::3] = np.nan
-    zs[0::3] = pos[src, 2];  zs[1::3] = pos[dst, 2];  zs[2::3] = np.nan
-
-    return go.Scatter3d(
-        x=xs, y=ys, z=zs,
-        mode="lines",
-        line=dict(color="grey", width=1),
-        hoverinfo="skip",
-        name="Edges",
-        visible="legendonly",  # hidden by default
-    )
+    src, dst = edge_index[0], edge_index[1]
+    cells = np.column_stack([
+        np.full(n_edges, 2, dtype=np.int64), src, dst,
+    ]).ravel()
+    mesh = pv.PolyData(pos_nm, lines=cells)
+    return mesh
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -192,12 +144,10 @@ def visualize(args):
 
     # optional node subsampling
     n_nodes = pos.shape[0]
-    node_idx = None
     if args.max_nodes > 0 and n_nodes > args.max_nodes:
         node_idx = _subsample_indices(n_nodes, args.max_nodes, rng)
         pos = pos[node_idx]
         features = features[node_idx]
-        # remap edges to subsampled node set
         idx_set = set(node_idx.tolist())
         old_to_new = {old: new for new, old in enumerate(node_idx)}
         mask = np.array([
@@ -206,14 +156,13 @@ def visualize(args):
         ])
         edge_index = edge_index[:, mask]
         edge_index = np.vectorize(old_to_new.get)(edge_index)
-        n_nodes = pos.shape[0]
 
     # convert to nanometres for display
     pos_nm = pos / 1e-9
 
     # colour channel
     ch = CHANNEL_MAP[args.color_by]
-    colors = features[:, ch]
+    scalars = features[:, ch]
 
     # arrow length: fraction of mean edge length
     mel = _mean_edge_length(pos_nm, edge_index if edge_index.shape[1] > 0
@@ -231,25 +180,7 @@ def visualize(args):
         vecs = None
         vec_label = None
 
-    # ── build traces ──
-    traces = []
-    traces.append(make_node_trace(pos_nm, colors, features, args.colorscale))
-
-    if vecs is not None:
-        if args.cone:
-            traces.append(make_vector_cones(
-                pos_nm, vecs, colors, arrow_len, args.colorscale,
-                vec_label, args.max_cones, rng,
-            ))
-        else:
-            traces.append(make_vector_lines(
-                pos_nm, vecs, colors, arrow_len, args.colorscale, vec_label,
-            ))
-
-    if args.max_edges != 0 and edge_index.shape[1] > 0:
-        traces.append(make_edge_trace(pos_nm, edge_index, args.max_edges, rng))
-
-    # ── layout ──
+    # ── build title ──
     shape_type = _try_load_shape_type(pt_path)
     n_total_edges = graph.edge_index.shape[1]
     title = (
@@ -258,21 +189,67 @@ def visualize(args):
         f"color: {args.color_by}"
     )
 
-    fig = go.Figure(data=traces)
-    fig.update_layout(
-        template="plotly_dark",
-        title=title,
-        scene=dict(
-            xaxis_title="x (nm)",
-            yaxis_title="y (nm)",
-            zaxis_title="z (nm)",
-            aspectmode="data",
-        ),
-        legend=dict(x=0.01, y=0.99),
-        margin=dict(l=0, r=0, t=40, b=0),
+    # ── PyVista plotter ──
+    plotter = pv.Plotter(theme=pv.themes.DarkTheme(), window_size=(1400, 900))
+    plotter.add_title(title, font_size=10)
+
+    # nodes
+    node_mesh = make_node_mesh(pos_nm, scalars, args.color_by)
+    plotter.add_mesh(
+        node_mesh,
+        scalars=args.color_by,
+        cmap=args.colorscale,
+        clim=[-1, 1],
+        point_size=5,
+        render_points_as_spheres=True,
+        show_scalar_bar=True,
+        scalar_bar_args=dict(title=args.color_by),
     )
 
-    fig.show()
+    # vectors
+    if vecs is not None:
+        if args.cone:
+            glyph_mesh = make_vector_glyph_mesh(
+                pos_nm, vecs, arrow_len, scalars,
+                args.color_by, args.max_cones, rng,
+            )
+            plotter.add_mesh(
+                glyph_mesh, scalars=args.color_by,
+                cmap=args.colorscale, clim=[-1, 1],
+                show_scalar_bar=False,
+            )
+        else:
+            line_mesh = make_vector_line_mesh(
+                pos_nm, vecs, arrow_len, scalars, args.color_by,
+            )
+            plotter.add_mesh(
+                line_mesh, scalars=args.color_by,
+                cmap=args.colorscale, clim=[-1, 1],
+                line_width=2, show_scalar_bar=False,
+            )
+
+    # edges (hidden by default, checkbox to toggle)
+    if args.max_edges != 0 and edge_index.shape[1] > 0:
+        edge_mesh = make_edge_mesh(pos_nm, edge_index, args.max_edges, rng)
+        edges_actor = plotter.add_mesh(
+            edge_mesh, color="grey", line_width=1, show_scalar_bar=False,
+        )
+        edges_actor.visibility = False
+
+        def toggle_edges(flag):
+            edges_actor.visibility = flag
+
+        plotter.add_checkbox_button_widget(
+            toggle_edges, value=False, position=(10, 10),
+            size=25, color_on="grey",
+        )
+
+    # axes
+    plotter.show_bounds(
+        xtitle="x (nm)", ytitle="y (nm)", ztitle="z (nm)", font_size=8,
+    )
+
+    plotter.show()
 
 
 def main():
@@ -293,7 +270,7 @@ def main():
     )
     parser.add_argument(
         "--colorscale", type=str, default="RdBu",
-        help="Plotly colorscale name (default: RdBu)",
+        help="Matplotlib colormap name (default: RdBu)",
     )
     parser.add_argument(
         "--cone", action="store_true",

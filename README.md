@@ -93,11 +93,11 @@ Converts Mumax3 simulation output (OVF2 binary voxel data) into PyTorch Geometri
 
 ### `visualize_graph.py`
 
-Interactive 3D visualisation tool for inspecting the PyG graph files produced by `voxel_to_graph.py`. Uses Plotly to render:
+Interactive 3D visualisation tool for inspecting the PyG graph files produced by `voxel_to_graph.py`. Uses PyVista (VTK-based desktop renderer) for high-performance 3D rendering:
 
-- **Nodes** coloured by a selectable feature channel (`mx`, `my`, `mz`, `nx`, `ny`, `nz`).
-- **Vector arrows** (line segments or cone glyphs) showing magnetisation or surface normal directions.
-- **Graph edges** (toggleable via legend, hidden by default).
+- **Nodes** coloured by a selectable feature channel (`mx`, `my`, `mz`, `nx`, `ny`, `nz`), rendered as spheres with a diverging colorbar.
+- **Vector arrows** (line segments or 3D arrow glyphs) showing magnetisation or surface normal directions.
+- **Graph edges** as grey lines, hidden by default with a checkbox widget to toggle visibility.
 
 Supports subsampling for large graphs and automatic detection of the shape type from the corresponding `geometry_info.json`.
 
@@ -108,12 +108,12 @@ Supports subsampling for large graphs and automatic detection of the shape type 
 | `graph` (positional) | — | Path to a `.pt` graph file |
 | `--vectors` | `normals` | Vector field to render: `normals`, `mag`, or `none` |
 | `--color-by` | `mz` | Feature channel for node colouring |
-| `--colorscale` | `RdBu` | Plotly colorscale name |
-| `--cone` | off | Use cone glyphs instead of line segments |
+| `--colorscale` | `RdBu` | Matplotlib colormap name |
+| `--cone` | off | Use 3D arrow glyphs instead of line segments |
 | `--vector-scale` | `1.0` | Arrow length multiplier relative to mean edge length |
 | `--max-nodes` | `0` (all) | Max nodes to render (0 = no limit) |
-| `--max-edges` | `5000` | Max edges to render (0 = skip edges) |
-| `--max-cones` | `2000` | Max cone glyphs when `--cone` is used |
+| `--max-edges` | `2000` | Max edges to render (0 = skip edges) |
+| `--max-cones` | `5000` | Max arrow glyphs when `--cone` is used |
 
 ---
 
@@ -213,4 +213,4 @@ python visualize_graph.py graphs/sim_0042.pt --vectors none
   - `scipy`
   - `torch`
   - `torch_geometric` (+ `torch-cluster`)
-  - `plotly`
+  - `pyvista`
