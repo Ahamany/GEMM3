@@ -43,10 +43,20 @@ The project is divided into several phases:
 
 ### `generate_dataset.py`
 
-Generates a synthetic dataset of chiral nanowire simulation inputs for EGNN training. For each sample, the script generates a **chiral nanowire** with randomised geometric parameters (helix radius, strand radius, pitch, length, chirality). It then produces:
+Generates a synthetic dataset of magnetic nanostructure simulation inputs for EGNN training. The script produces two geometry types selected randomly with a **2:1 ratio** (double helix : twisted wire):
+
+**1. Chiral Nanowire** (`chiral_nanowire`) — Two intertwined helical strands (180° apart) built from CSG `Ellipsoid` spheres. Randomised parameters: helix radius (0.6-1.0 x strand_r), strand radius (5-15 nm), pitch (20-60 nm), length (80-200 nm), chirality (+/-1). Supports **chirality inversion defects** — structural points along Z where the twist direction reverses:
+   - 20% ideal (no inversions), 64% single inversion, 16% double inversion.
+   - Inversions cannot occur within the first/last 15% of the wire length.
+   - For double inversions, the two points must be at least 20% of the length apart.
+   - Phase continuity is maintained at each inversion point so the helix has no geometric breaks.
+
+**2. Twisted Nanowire** (`twisted_nanowire`) — A solid rod with an elliptical cross-section that rotates along Z, built from CSG `Cylinder` slices. Randomised parameters: major diameter (40-80 nm), minor diameter (15-30 nm), length (100-300 nm), number of turns (1-4), chirality (+/-1).
+
+For each sample, the script produces:
 
 - **`sim.mx3`** — A complete Mumax3 simulation script with FFT-friendly grid dimensions, edge smoothing (`EdgeSmooth = 8`), permalloy-like material parameters (Msat = 8e5 A/m, Aex = 1.3e-11 J/m), random initial magnetisation, and a `Relax()` energy minimisation step.
-- **`geometry_info.json`** — Shape parameters, grid metadata, and analytical surface equations (implicit form + parametric form where applicable). This file is consumed downstream by `voxel_to_graph.py` for geometric projection.
+- **`geometry_info.json`** — Shape parameters, grid metadata, and analytical surface equations. Chiral nanowires use a `piecewise_helix` format with explicit segments (chirality, phase offset per segment). Twisted nanowires describe the cross-section ellipse and twist parameters. This file is consumed downstream by `voxel_to_graph.py` for geometric projection.
 
 The script also writes a `tasks.txt` file listing all simulation directories, intended for SLURM job array integration.
 
@@ -65,9 +75,10 @@ The script also writes a `tasks.txt` file listing all simulation directories, in
 Converts Mumax3 simulation output (OVF2 binary voxel data) into PyTorch Geometric graph objects. This is the core artifact-correction step of the pipeline. The script:
 
 1. **Parses OVF2 binary files** — Reads the header for grid dimensions and cell sizes, decodes the float32 payload, and computes origin-centred voxel coordinates. Empty cells (vacuum) are discarded.
-2. **Projects voxel centres onto analytical surfaces** — Uses the shape equations from `geometry_info.json` to map discretised voxel positions onto the ideal continuous surface, eliminating the FDM "staircase effect." The projector is implemented as:
-   - **ChiralNanowireProjector** — Gradient-based (L-BFGS) projection using the closed-form Frenet frame of helix centrelines plus analytical cylinder projection for the core. Surface normals computed via `torch.autograd` cross-product of parametric partials (dS/dp0 x dS/dp1).
-3. **Computes surface normals** — Autograd cross-product of parametric partials (dS/dp0 x dS/dp1).
+2. **Projects voxel centres onto analytical surfaces** — Uses the shape equations from `geometry_info.json` to map discretised voxel positions onto the ideal continuous surface, eliminating the FDM "staircase effect." Two projectors are available:
+   - **ChiralNanowireProjector** — Handles `piecewise_helix` strands with chirality inversions. Assigns each voxel to its nearest strand via dense centreline sampling, then optimises parametric tube coordinates `(t, v)` with L-BFGS. Uses `torch.where` for differentiable piecewise segment selection (chirality and phase offset per segment). Frenet frame (T, N, B) computed in closed form.
+   - **TwistedNanowireProjector** — Projects voxels onto the lateral surface of a twisted elliptical rod. Parametric surface `S(z, phi)` rotates an ellipse boundary by the twist angle `theta(z)`. Optimises `(z, phi)` with L-BFGS.
+3. **Computes surface normals** — Autograd cross-product of parametric partials (dS/dp0 x dS/dp1), shared by both projectors via `BaseProjector._normals_from_autograd`.
 4. **Assembles PyG `Data` objects** — Each graph contains node positions (`pos`), a feature matrix `x` of shape [N, 6] (magnetisation `[mx, my, mz]` + surface normals `[nx, ny, nz]`), and an `edge_index` built via radius graph.
 
 **Arguments:**
@@ -199,6 +210,7 @@ python visualize_graph.py graphs/sim_0042.pt --vectors none
 - **Mumax3** (Go/CUDA) — for running the `.mx3` simulations
 - Python packages:
   - `numpy`
+  - `scipy`
   - `torch`
-  - `torch_geometric`
-    - `plotly`
+  - `torch_geometric` (+ `torch-cluster`)
+  - `plotly`

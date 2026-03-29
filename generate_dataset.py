@@ -60,6 +60,63 @@ def fv(v):
     return f"{v:.10g}"
 
 
+def _sample_inversions(rng, length):
+    """Sample chirality inversion z-positions.
+
+    Probabilistic distribution:
+      20 % → ideal helix (0 inversions)
+      64 % → single chirality switch
+      16 % → double chirality switch
+
+    Spatial constraints (L = length):
+      - No inversion within first/last 15 % of L.
+      - For double: |z2 - z1| >= 0.20 * L.
+
+    Returns a sorted list of 0, 1, or 2 absolute z-positions (metres).
+    """
+    roll = rng.random()
+    if roll < 0.20:
+        return []
+
+    half = length / 2
+    margin = 0.15 * length
+    z_lo = -half + margin
+    z_hi = half - margin
+
+    if roll < 0.84:                             # 0.20 + 0.64
+        return [rng.uniform(z_lo, z_hi)]
+
+    # Double inversion — rejection sampling (acceptance ≈ 71 %)
+    min_sep = 0.20 * length
+    while True:
+        z1 = rng.uniform(z_lo, z_hi)
+        z2 = rng.uniform(z_lo, z_hi)
+        if abs(z2 - z1) >= min_sep:
+            return sorted([z1, z2])
+
+
+def _build_segments(chirality, pitch, half, inversions):
+    """Build piecewise helix segments with accumulated phase offsets.
+
+    At each inversion point z_inv the chirality flips and a phase offset
+    is accumulated so that θ(z) = h_k · 2π·z/P + φ_k is continuous:
+
+        φ_next = φ_prev + 2 · h_prev · 2π · z_inv / pitch
+
+    Returns list of (z_start, z_end, h, phase_offset) tuples.
+    """
+    boundaries = [-half] + list(inversions) + [half]
+    segments = []
+    h, phi = chirality, 0.0
+    for k in range(len(boundaries) - 1):
+        segments.append((boundaries[k], boundaries[k + 1], h, phi))
+        if k < len(boundaries) - 2:
+            z_inv = boundaries[k + 1]
+            phi += 2 * h * 2 * math.pi * z_inv / pitch
+            h = -h
+    return segments
+
+
 # ---------------------------------------------------------------------------
 # mx3 assembly
 # ---------------------------------------------------------------------------
@@ -115,12 +172,21 @@ def gen_chiral_nanowire(rng):
     d = 2 * strand_r
     half = length / 2
 
+    # --- chirality inversions ---
+    inversions = _sample_inversions(rng, length)
+    segments = _build_segments(chirality, pitch, half, inversions)
+
     lines = []
     first = True
     for i in range(n_pts):
         t = i / (n_pts - 1)          # 0 → 1
         z = -half + t * length
-        theta = chirality * 2 * math.pi * z / pitch
+
+        # Segment-aware angle (piecewise chirality with phase continuity)
+        for _zs, z_end, h_seg, phi_seg in segments:
+            if z <= z_end:
+                theta = h_seg * 2 * math.pi * z / pitch + phi_seg
+                break
 
         for offset in (0.0, math.pi):  # two strands, 180° apart
             x = helix_r * math.cos(theta + offset)
@@ -133,7 +199,6 @@ def gen_chiral_nanowire(rng):
             else:
                 lines.append(f"geo = geo.Add({sphere})")
 
-    chi = "+" if chirality > 0 else "-"
     params = dict(
         shape_type="chiral_nanowire",
         helix_radius_m=helix_r,
@@ -141,33 +206,31 @@ def gen_chiral_nanowire(rng):
         pitch_m=pitch,
         length_m=length,
         chirality=chirality,
+        n_inversions=len(inversions),
+        inversion_z_m=inversions,
         n_points_per_strand=n_pts,
     )
 
+    def _strand_dict(strand_phase):
+        return dict(
+            type="piecewise_helix",
+            R_h=helix_r,
+            P=pitch,
+            strand_phase_rad=strand_phase,
+            segments=[
+                dict(z_start=zs, z_end=ze,
+                     chirality=h, phase_offset_rad=phi)
+                for zs, ze, h, phi in segments
+            ],
+        )
+
     surface = dict(
         implicit_body="min(dist(P,C1), dist(P,C2)) <= r_strand",
-        chirality=chirality,
+        initial_chirality=chirality,
+        inversions_z_m=inversions,
         centerlines=dict(
-            strand_1=dict(
-                type="helix",
-                parametric=dict(
-                    x=f"R_h*cos({chi}2*pi*t/P)",
-                    y=f"R_h*sin({chi}2*pi*t/P)",
-                    z="t",
-                    t_range=[-half, half],
-                ),
-                R_h=helix_r, P=pitch,
-            ),
-            strand_2=dict(
-                type="helix",
-                parametric=dict(
-                    x=f"R_h*cos({chi}2*pi*t/P + pi)",
-                    y=f"R_h*sin({chi}2*pi*t/P + pi)",
-                    z="t",
-                    t_range=[-half, half],
-                ),
-                R_h=helix_r, P=pitch,
-            ),
+            strand_1=_strand_dict(0.0),
+            strand_2=_strand_dict(math.pi),
         ),
         strand_tube=dict(
             description="Tubular surface of radius r_strand around each helix centreline",
@@ -180,10 +243,75 @@ def gen_chiral_nanowire(rng):
     return lines, params, surface, bbox
 
 
+def gen_twisted_nanowire(rng):
+    """Solid rod with elliptical cross-section that twists along Z."""
+    D_major = rng.uniform(40e-9, 80e-9)
+    D_minor = rng.uniform(15e-9, 30e-9)
+    L = rng.uniform(100e-9, 300e-9)
+    n_turns = rng.uniform(1.0, 4.0)
+    chirality = rng.choice([-1, 1])
+
+    # Slice thickness = cell size, adjusted for exact fit
+    n_slices = max(2, math.ceil(L / CELL))
+    dz = L / n_slices
+
+    half = L / 2
+    scale_y = D_minor / D_major
+
+    lines = []
+    first = True
+    for i in range(n_slices):
+        z_center = -half + i * dz + dz / 2
+        theta = chirality * 2 * math.pi * n_turns * (z_center + half) / L
+
+        sl = (f"Cylinder({fv(D_major)}, {fv(dz)})"
+              f".Scale(1, {fv(scale_y)}, 1)"
+              f".RotZ({fv(theta)})"
+              f".Transl(0, 0, {fv(z_center)})")
+        if first:
+            lines.append(f"geo := {sl}")
+            first = False
+        else:
+            lines.append(f"geo = geo.Add({sl})")
+
+    params = dict(
+        shape_type="twisted_nanowire",
+        D_major_m=D_major,
+        D_minor_m=D_minor,
+        length_m=L,
+        n_turns=n_turns,
+        chirality=chirality,
+        n_inversions=0,
+        n_slices=n_slices,
+        slice_thickness_m=dz,
+    )
+
+    surface = dict(
+        implicit_body="rotate(x,y,-theta(z)) -> (x',y'); x'^2/a^2 + y'^2/b^2 <= 1",
+        shape_type="twisted_nanowire",
+        cross_section=dict(
+            type="ellipse",
+            semi_major_m=D_major / 2,
+            semi_minor_m=D_minor / 2,
+        ),
+        twist=dict(
+            chirality=chirality,
+            n_turns=n_turns,
+            z_range=[-half, half],
+        ),
+    )
+
+    bbox = (D_major, D_major, L)
+    return lines, params, surface, bbox
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-GENERATORS = [gen_chiral_nanowire]
+GENERATORS = [
+    (gen_chiral_nanowire, 2),    # 2/3
+    (gen_twisted_nanowire, 1),   # 1/3
+]
 
 
 def main():
@@ -207,7 +335,8 @@ def main():
         sim_dir = os.path.join(args.output_dir, sim_name)
         os.makedirs(sim_dir, exist_ok=True)
 
-        gen = rng.choice(GENERATORS)
+        gens, weights = zip(*GENERATORS)
+        gen = rng.choices(gens, weights=weights, k=1)[0]
         geom_lines, params, analytical_surface, bbox = gen(rng)
         nx, ny, nz = grid_dims(*bbox)
 
@@ -228,8 +357,10 @@ def main():
             json.dump(info, f, indent=2)
 
         task_paths.append(sim_dir)
+        n_inv = params["n_inversions"]
+        defect = f"{n_inv}inv" if n_inv > 0 else "ideal"
         print(f"[{i+1:4d}/{args.num_sims}] {sim_name}:  "
-              f"{params['shape_type']:20s}  grid {nx}x{ny}x{nz}")
+              f"{params['shape_type']:20s}  {defect:6s}  grid {nx}x{ny}x{nz}")
 
     # Write task list for SLURM
     tasks_file = "tasks.txt"

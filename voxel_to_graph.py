@@ -9,7 +9,8 @@ Pipeline:
 
 Projector hierarchy:
   BaseProjector (ABC)
-  └── ChiralNanowireProjector — gradient-based (L-BFGS + Frenet frame)
+  ├── ChiralNanowireProjector — piecewise helix tubes  (L-BFGS + Frenet frame)
+  └── TwistedNanowireProjector — twisted elliptical rod (L-BFGS)
 """
 
 import json
@@ -151,17 +152,58 @@ class BaseProjector(ABC):
         """
         ...
 
+    @staticmethod
+    def _length_scale(P: torch.Tensor) -> float:
+        """Characteristic length for normalisation (keeps loss O(1))."""
+        return float(P.abs().max().clamp(min=1e-15))
+
+    @staticmethod
+    def _normals_from_autograd(surf_fn, p0, p1, P_target):
+        """Compute ideal positions and normals via cross product of partials.
+
+        Uses the optimised parameters to evaluate S(p0, p1) and compute
+        dS/dp0 × dS/dp1 with ``torch.autograd``.
+        """
+        u = p0.detach().requires_grad_(True)
+        v = p1.detach().requires_grad_(True)
+
+        S = surf_fn(u, v)  # [N, 3]
+        Sx, Sy, Sz = S[:, 0], S[:, 1], S[:, 2]
+
+        # 3 backward passes → 6 partial derivatives
+        gx = torch.autograd.grad(Sx.sum(), [u, v], retain_graph=True)
+        gy = torch.autograd.grad(Sy.sum(), [u, v], retain_graph=True)
+        gz = torch.autograd.grad(Sz.sum(), [u, v], retain_graph=True)
+
+        dS_du = torch.stack([gx[0], gy[0], gz[0]], dim=-1)  # [N, 3]
+        dS_dv = torch.stack([gx[1], gy[1], gz[1]], dim=-1)  # [N, 3]
+
+        cross = torch.linalg.cross(dS_du, dS_dv)
+        cross_norm = cross.norm(dim=-1, keepdim=True)
+
+        # handle singularities: fall back to (P_ideal - origin) direction
+        singular = cross_norm.squeeze(-1) < 1e-12
+        normals = cross / cross_norm.clamp(min=1e-12)
+
+        if singular.any():
+            fallback_dir = S[singular]
+            fallback_norm = fallback_dir.norm(dim=-1, keepdim=True).clamp(
+                min=1e-12,
+            )
+            normals[singular] = fallback_dir / fallback_norm
+
+        return S.detach(), normals.detach()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 2a: ChiralNanowireProjector (gradient-based)
+# Section 2a: ChiralNanowireProjector (piecewise helix tubes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChiralNanowireProjector(BaseProjector):
     """Gradient-based projection for chiral nanowire surfaces.
 
-    Helix-tube surface around helix centrelines built directly in torch
-    using the closed-form Frenet frame, plus analytical projection for
-    the core cylinder.
+    Supports ``piecewise_helix`` strands with chirality inversions.
+    Each strand carries a ``segments`` list and a ``strand_phase_rad``.
 
     Optimiser: L-BFGS (vectorised over all N points simultaneously).
     Normals:   dS/dp0 × dS/dp1 via ``torch.autograd``.
@@ -175,41 +217,44 @@ class ChiralNanowireProjector(BaseProjector):
         self.analytical_surface = analytical_surface
 
     @staticmethod
-    def _length_scale(P: torch.Tensor) -> float:
-        """Characteristic length for normalisation (keeps loss O(1))."""
-        return float(P.abs().max().clamp(min=1e-15))
-
-    @staticmethod
     def _build_helix_tube_fn(strand_info: dict, r_strand: float,
                              scale: float = 1.0):
-        """Build a torch function for the tube surface around a helix.
+        """Build a torch function for the piecewise helix tube surface.
 
-        Uses the closed-form Frenet frame of a circular helix.
-        When *scale* ≠ 1 the returned function produces coordinates in
-        normalised (O(1)) space: all lengths are divided by *scale*, while
-        angles are unaffected.
+        Reads ``strand_info["segments"]`` (each with chirality and
+        phase_offset_rad) and ``strand_info["strand_phase_rad"]``.
+        Uses ``torch.where`` for differentiable segment selection.
         """
         R_h = strand_info["R_h"] / scale
         P_pitch = strand_info["P"] / scale
         r_s = r_strand / scale
-        t_range = strand_info["parametric"]["t_range"]
-        t_lo = float(t_range[0]) / scale
-        t_hi = float(t_range[1]) / scale
+        strand_phase = strand_info["strand_phase_rad"]
+        segments = strand_info["segments"]
 
-        # detect chirality from the parametric expression sign
-        expr_x = strand_info["parametric"]["x"]
-        chirality = -1.0 if "-2*pi" in expr_x else 1.0
+        # precompute per-segment data (scaled)
+        seg_data = []
+        for seg in segments:
+            seg_data.append((
+                seg["z_start"] / scale,
+                seg["z_end"] / scale,
+                seg["chirality"] * 2.0 * torch.pi / P_pitch,
+                seg["phase_offset_rad"],
+            ))
 
-        # detect phase offset (strand_2 has +pi)
-        phase = 0.0
-        if "+ pi" in expr_x or "+pi" in expr_x:
-            phase = torch.pi
-
-        omega = chirality * 2.0 * torch.pi / P_pitch
+        t_lo = seg_data[0][0]
+        t_hi = seg_data[-1][1]
 
         def tube_fn(t, v):
             """S(t, v) = C(t) + r * (N(t)*cos(v) + B(t)*sin(v))"""
-            angle = omega * t + phase
+            # piecewise omega and phase via torch.where
+            omega = torch.zeros_like(t)
+            phi = torch.zeros_like(t)
+            for z_lo, z_hi, om, ph in seg_data:
+                mask = (t >= z_lo) & (t <= z_hi)
+                omega = torch.where(mask, torch.full_like(omega, om), omega)
+                phi = torch.where(mask, torch.full_like(phi, ph), phi)
+
+            angle = omega * t + phi + strand_phase
 
             # helix centreline C(t)
             cx = R_h * torch.cos(angle)
@@ -247,137 +292,107 @@ class ChiralNanowireProjector(BaseProjector):
     def _project_chiral(self, P_voxel: torch.Tensor):
         info = self.analytical_surface
         centerlines = info["centerlines"]
-        core = info["core"]
         r_strand = info["strand_tube"]["r_strand"]
-        R_core = core["R"]
-        z_lo, z_hi = core["z_range"]
 
         P = P_voxel.double()
         N = P.shape[0]
         scale = self._length_scale(P)
-        x, y, z = P[:, 0], P[:, 1], P[:, 2]
 
         strand_keys = sorted(centerlines.keys())
 
-        # --- assign each voxel to nearest component ---
-        # Use containment test: if point is inside a strand tube, assign
-        # to that strand.  Only fall back to core for points not inside
-        # any strand.  This avoids the pathology where points deep inside
-        # a strand are closer to the core *surface* than to the tube wall.
-
-        rho = torch.sqrt(x ** 2 + y ** 2)
-
-        # compute distance to each strand centreline (dense helix sampling)
-        strand_cl_dists = []  # distance to centreline per strand
+        # --- assign each voxel to nearest strand centreline ---
+        strand_cl_dists = []
         for sk in strand_keys:
             s = centerlines[sk]
             R_h = s["R_h"]
             P_pitch = s["P"]
-            tlo = float(s["parametric"]["t_range"][0])
-            thi = float(s["parametric"]["t_range"][1])
-            expr_x = s["parametric"]["x"]
-            chirality = -1.0 if "-2*pi" in expr_x else 1.0
-            phase = torch.pi if ("+ pi" in expr_x or "+pi" in expr_x) else 0.0
-            omega = chirality * 2.0 * torch.pi / P_pitch
+            strand_phase = s["strand_phase_rad"]
+            segments = s["segments"]
 
-            n_samples = max(200, int((thi - tlo) / (r_strand * 0.5)))
-            t_samples = torch.linspace(tlo, thi, n_samples, dtype=torch.float64)
-            angles = omega * t_samples + phase
-            hx = R_h * torch.cos(angles)
-            hy = R_h * torch.sin(angles)
-            hz = t_samples
+            # dense sampling along the piecewise helix centreline
+            all_pts = []
+            for seg in segments:
+                tlo = seg["z_start"]
+                thi = seg["z_end"]
+                chi = seg["chirality"]
+                phi_off = seg["phase_offset_rad"]
+                omega = chi * 2.0 * torch.pi / P_pitch
 
-            helix_pts = torch.stack([hx, hy, hz], dim=-1)  # [S, 3]
+                n_seg = max(50, int((thi - tlo) / (r_strand * 0.5)))
+                t_seg = torch.linspace(tlo, thi, n_seg, dtype=torch.float64)
+                angles = omega * t_seg + phi_off + strand_phase
+                hx = R_h * torch.cos(angles)
+                hy = R_h * torch.sin(angles)
+                hz = t_seg
+                all_pts.append(torch.stack([hx, hy, hz], dim=-1))
+
+            helix_pts = torch.cat(all_pts, dim=0)
             diff = P.unsqueeze(1) - helix_pts.unsqueeze(0)
-            dists_to_cl = diff.norm(dim=-1)
-            min_dist_cl = dists_to_cl.min(dim=1).values  # [N]
+            min_dist_cl = diff.norm(dim=-1).min(dim=1).values
             strand_cl_dists.append(min_dist_cl)
 
-        # containment: point is inside strand if dist_to_centreline < r_strand
-        inside_strand = [d < r_strand for d in strand_cl_dists]
-        inside_any_strand = torch.zeros(N, dtype=torch.bool)
-        for mask in inside_strand:
-            inside_any_strand |= mask
-
-        # for points inside multiple strands, pick the nearest centreline
-        labels = torch.zeros(N, dtype=torch.long)  # 0 = core (default)
-        if inside_any_strand.any():
-            cl_stack = torch.stack(strand_cl_dists, dim=-1)  # [N, n_strands]
-            nearest_strand = cl_stack.argmin(dim=-1)  # [N]
-            labels[inside_any_strand] = nearest_strand[inside_any_strand] + 1
-
-        # points not inside any strand and not inside core: nearest surface
-        inside_core = (rho < R_core) & (z.abs() < abs(z_hi))
-        unassigned = ~inside_any_strand & ~inside_core
-        if unassigned.any():
-            d_core_surf = torch.abs(rho[unassigned] - R_core)
-            strand_surf = torch.stack(
-                [torch.abs(d - r_strand) for d in strand_cl_dists], dim=-1,
-            )[unassigned]
-            all_d = torch.cat([d_core_surf.unsqueeze(-1), strand_surf], dim=-1)
-            labels[unassigned] = all_d.argmin(dim=-1)
+        # assign each voxel to the nearest strand
+        cl_stack = torch.stack(strand_cl_dists, dim=-1)  # [N, n_strands]
+        labels = cl_stack.argmin(dim=-1)                  # [N]
 
         P_ideal = torch.zeros_like(P)
         normals = torch.zeros_like(P)
 
-        # --- core: analytical cylinder projection ---
-        m_core = labels == 0
-        if m_core.any():
-            Pc = P[m_core]
-            xc, yc, zc = Pc[:, 0], Pc[:, 1], Pc[:, 2]
-            rho_c = torch.sqrt(xc ** 2 + yc ** 2).clamp(min=1e-15)
-            cos_phi = xc / rho_c
-            sin_phi = yc / rho_c
-            z_clamp = zc.clamp(z_lo, z_hi)
-            P_ideal[m_core] = torch.stack(
-                [R_core * cos_phi, R_core * sin_phi, z_clamp], dim=-1,
-            )
-            normals[m_core] = torch.stack(
-                [cos_phi, sin_phi, torch.zeros_like(cos_phi)], dim=-1,
-            )
-
         # --- strands: parametric optimisation (scaled coordinates) ---
         for i, sk in enumerate(strand_keys):
-            m_strand = labels == (i + 1)
+            m_strand = labels == i
             if not m_strand.any():
                 continue
 
             P_s = P[m_strand]
             P_s_norm = P_s / scale
 
-            # scaled tube function for optimisation
             tube_fn_s, tlo_s, thi_s = self._build_helix_tube_fn(
                 centerlines[sk], r_strand, scale=scale,
             )
 
-            # initial guess: t ≈ z/scale, v from atan2 of offset from
-            # centreline to get a good angular starting point
+            # initial guess: t ≈ z/scale
             t0 = P_s_norm[:, 2].clamp(tlo_s, thi_s)
 
-            # compute initial v from the vector (P - C(t0))
+            # piecewise omega/phase for the initial angle at t0
             s_info = centerlines[sk]
             R_h_s = s_info["R_h"] / scale
             P_pitch_s = s_info["P"] / scale
-            expr_x = s_info["parametric"]["x"]
-            chi = -1.0 if "-2*pi" in expr_x else 1.0
-            ph = torch.pi if ("+ pi" in expr_x or "+pi" in expr_x) else 0.0
-            om = chi * 2.0 * torch.pi / P_pitch_s
-            angle0 = om * t0 + ph
+            sp = s_info["strand_phase_rad"]
+
+            omega0 = torch.zeros_like(t0)
+            phase0 = torch.zeros_like(t0)
+            for seg in s_info["segments"]:
+                z_lo_seg = seg["z_start"] / scale
+                z_hi_seg = seg["z_end"] / scale
+                chi = seg["chirality"]
+                phi = seg["phase_offset_rad"]
+                mask = (t0 >= z_lo_seg) & (t0 <= z_hi_seg)
+                om_val = chi * 2.0 * torch.pi / P_pitch_s
+                omega0 = torch.where(
+                    mask, torch.full_like(omega0, om_val), omega0,
+                )
+                phase0 = torch.where(
+                    mask, torch.full_like(phase0, phi), phase0,
+                )
+
+            angle0 = omega0 * t0 + phase0 + sp
             cx0 = R_h_s * torch.cos(angle0)
             cy0 = R_h_s * torch.sin(angle0)
             dx = P_s_norm[:, 0] - cx0
             dy = P_s_norm[:, 1] - cy0
             dz = P_s_norm[:, 2] - t0
+
             # project onto N and B directions to get v0
             nx0 = -torch.cos(angle0)
             ny0 = -torch.sin(angle0)
-            proj_N = dx * nx0 + dy * ny0  # component along N
-            # B direction (simplified for initial guess)
-            tx0 = -R_h_s * om * torch.sin(angle0)
-            ty0 = R_h_s * om * torch.cos(angle0)
+            proj_N = dx * nx0 + dy * ny0
+
+            tx0 = -R_h_s * omega0 * torch.sin(angle0)
+            ty0 = R_h_s * omega0 * torch.cos(angle0)
             tz0 = torch.ones_like(t0)
-            tn = torch.sqrt(tx0**2 + ty0**2 + tz0**2)
-            tx0, ty0, tz0 = tx0/tn, ty0/tn, tz0/tn
+            tn = torch.sqrt(tx0 ** 2 + ty0 ** 2 + tz0 ** 2)
+            tx0, ty0, tz0 = tx0 / tn, ty0 / tn, tz0 / tn
             bx0 = ty0 * 0 - tz0 * ny0
             by0 = tz0 * nx0 - tx0 * 0
             bz0 = tx0 * ny0 - ty0 * nx0
@@ -404,7 +419,6 @@ class ChiralNanowireProjector(BaseProjector):
                 optimizer.step(closure)
 
             # normals: use unscaled tube function at the optimised params
-            # (rescale t back to metres)
             tube_fn_orig, _, _ = self._build_helix_tube_fn(
                 centerlines[sk], r_strand, scale=1.0,
             )
@@ -419,46 +433,126 @@ class ChiralNanowireProjector(BaseProjector):
 
         return P_ideal.float(), normals.float()
 
-    # ------------------------------------------------------------------
-    # Autograd normals (shared)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _normals_from_autograd(surf_fn, p0, p1, P_target):
-        """Compute ideal positions and normals via cross product of partials.
-
-        Uses the optimised parameters to evaluate S(p0, p1) and compute
-        dS/dp0 × dS/dp1 with ``torch.autograd``.
-        """
-        u = p0.detach().requires_grad_(True)
-        v = p1.detach().requires_grad_(True)
-
-        S = surf_fn(u, v)  # [N, 3]
-        Sx, Sy, Sz = S[:, 0], S[:, 1], S[:, 2]
-
-        # 3 backward passes → 6 partial derivatives
-        gx = torch.autograd.grad(Sx.sum(), [u, v], retain_graph=True)
-        gy = torch.autograd.grad(Sy.sum(), [u, v], retain_graph=True)
-        gz = torch.autograd.grad(Sz.sum(), [u, v], retain_graph=True)
-
-        dS_du = torch.stack([gx[0], gy[0], gz[0]], dim=-1)  # [N, 3]
-        dS_dv = torch.stack([gx[1], gy[1], gz[1]], dim=-1)  # [N, 3]
-
-        cross = torch.linalg.cross(dS_du, dS_dv)
-        cross_norm = cross.norm(dim=-1, keepdim=True)
-
-        # handle singularities: fall back to (P_ideal - origin) direction
-        singular = cross_norm.squeeze(-1) < 1e-12
-        normals = cross / cross_norm.clamp(min=1e-12)
-
-        if singular.any():
-            fallback_dir = S[singular]
-            fallback_norm = fallback_dir.norm(dim=-1, keepdim=True).clamp(min=1e-12)
-            normals[singular] = fallback_dir / fallback_norm
-
-        return S.detach(), normals.detach()
-
     def project(self, P_voxel: torch.Tensor):
         return self._project_chiral(P_voxel)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section 2b: TwistedNanowireProjector (twisted elliptical rod)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TwistedNanowireProjector(BaseProjector):
+    """Gradient-based projection for twisted nanowire surfaces.
+
+    The geometry is a solid rod whose elliptical cross-section rotates
+    along Z.  Parametric surface S(z, φ):
+
+        θ(z)  = chirality · 2π · n_turns · (z − z_lo) / L
+        x     = a·cos(φ)·cos(θ) − b·sin(φ)·sin(θ)
+        y     = a·cos(φ)·sin(θ) + b·sin(φ)·cos(θ)
+        z_s   = z
+
+    Optimiser: L-BFGS (vectorised over all N points simultaneously).
+    Normals:   dS/dz × dS/dφ via ``torch.autograd``.
+    """
+
+    def __init__(self, analytical_surface: dict,
+                 lr: float = 1.0, num_steps: int = 60, max_iter: int = 20):
+        self.lr = lr
+        self.num_steps = num_steps
+        self.max_iter = max_iter
+        self.analytical_surface = analytical_surface
+
+    @staticmethod
+    def _build_twisted_surface_fn(surface_info: dict, scale: float = 1.0):
+        """Build a torch function for the twisted-ellipse lateral surface."""
+        cs = surface_info["cross_section"]
+        tw = surface_info["twist"]
+        a = cs["semi_major_m"] / scale
+        b = cs["semi_minor_m"] / scale
+        chirality = tw["chirality"]
+        n_turns = tw["n_turns"]
+        z_lo = tw["z_range"][0] / scale
+        z_hi = tw["z_range"][1] / scale
+        L = z_hi - z_lo
+
+        def surface_fn(z_s, phi):
+            theta = chirality * 2.0 * torch.pi * n_turns * (z_s - z_lo) / L
+
+            # ellipse boundary in local cross-section frame
+            ex = a * torch.cos(phi)
+            ey = b * torch.sin(phi)
+
+            # rotate by theta into lab frame
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+            sx = ex * cos_t - ey * sin_t
+            sy = ex * sin_t + ey * cos_t
+            sz = z_s
+
+            return torch.stack([sx, sy, sz], dim=-1)
+
+        return surface_fn, z_lo, z_hi
+
+    def project(self, P_voxel: torch.Tensor):
+        info = self.analytical_surface
+        P = P_voxel.double()
+        scale = self._length_scale(P)
+
+        cs = info["cross_section"]
+        tw = info["twist"]
+        a_s = cs["semi_major_m"] / scale
+        b_s = cs["semi_minor_m"] / scale
+        chirality = tw["chirality"]
+        n_turns = tw["n_turns"]
+        z_range = tw["z_range"]
+        z_lo_s = z_range[0] / scale
+        z_hi_s = z_range[1] / scale
+        L_s = z_hi_s - z_lo_s
+
+        surf_fn_s, _, _ = self._build_twisted_surface_fn(info, scale=scale)
+
+        P_norm = P / scale
+        x, y, z = P_norm[:, 0], P_norm[:, 1], P_norm[:, 2]
+
+        # initial guess: z_s0 = z, phi0 from rotated coordinates
+        z0 = z.clamp(z_lo_s, z_hi_s)
+        theta0 = chirality * 2.0 * torch.pi * n_turns * (z0 - z_lo_s) / L_s
+        cos_t0 = torch.cos(theta0)
+        sin_t0 = torch.sin(theta0)
+        x_loc = x * cos_t0 + y * sin_t0
+        y_loc = -x * sin_t0 + y * cos_t0
+        phi0 = torch.atan2(y_loc / b_s, x_loc / a_s)
+
+        params_z = z0.clone().requires_grad_(True)
+        params_phi = phi0.clone().requires_grad_(True)
+
+        optimizer = torch.optim.LBFGS(
+            [params_z, params_phi], lr=self.lr, max_iter=self.max_iter,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure(pz=params_z, pp=params_phi, target=P_norm,
+                    fn=surf_fn_s):
+            optimizer.zero_grad()
+            S = fn(pz, pp)
+            loss = ((S - target) ** 2).sum()
+            loss.backward()
+            return loss
+
+        for _ in range(self.num_steps):
+            optimizer.step(closure)
+
+        # normals at unscaled coordinates
+        surf_fn_orig, _, _ = self._build_twisted_surface_fn(info, scale=1.0)
+        z_orig = (params_z * scale).detach()
+        phi_orig = params_phi.detach()
+
+        P_ideal, normals = self._normals_from_autograd(
+            surf_fn_orig, z_orig, phi_orig, P,
+        )
+
+        return P_ideal.float(), normals.float()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,6 +566,8 @@ def projector_factory(geometry_info: dict) -> BaseProjector:
 
     if shape == "chiral_nanowire":
         return ChiralNanowireProjector(analytical_surface=surface)
+    elif shape == "twisted_nanowire":
+        return TwistedNanowireProjector(analytical_surface=surface)
     else:
         raise ValueError(f"Unknown shape type: {shape}")
 
